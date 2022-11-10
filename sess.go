@@ -166,6 +166,8 @@ type (
 		// rate limiter (bytes per second)
 		rateLimiter atomic.Value
 
+		FnOutOfBandPing TOutOfBandPing
+
 		mu sync.Mutex
 
 		// callbackForOOB is an optional callback for handling received out-of-band (OOB) data.
@@ -357,6 +359,9 @@ RESET_TIMER:
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		}
 	}
+}
+func (s *UDPSession) WriteOutOfBand(b []byte) (n int, err error) {
+	return s.conn.WriteTo(b, s.remote)
 }
 
 // Write implements net.Conn
@@ -968,6 +973,10 @@ func (s *UDPSession) notifyWriteError(err error) {
 //
 // Pipeline: Network -> [Decrypt] -> [CRC32] -> kcpInput
 func (s *UDPSession) packetInput(data []byte) {
+	if len(data) == 16 {
+		go ClientOutOfBandPing(data, s)
+		return
+	}
 	switch block := s.block.(type) {
 	case nil:
 	case *aeadCrypt:
@@ -1146,6 +1155,8 @@ type (
 		socketReadErrorOnce sync.Once
 
 		rd atomic.Value // read deadline for Accept()
+
+		FnOutOfBandPing TOutOfBandPing
 	}
 )
 
@@ -1153,6 +1164,11 @@ type (
 // It decrypts the packet, demultiplexes by remote address,
 // and dispatches to existing sessions or creates new ones.
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
+	if len(data) == 16 {
+		go ListenerOutOfBandPing(data, addr, l)
+		//len = 16 is not a valid kcp packet
+		return
+	}
 	switch block := l.block.(type) {
 	case nil:
 	case *aeadCrypt:
@@ -1199,6 +1215,10 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	l.sessionLock.RLock()
 	s, exist := l.sessions[addr.String()]
 	l.sessionLock.RUnlock()
+
+	if !exist {
+		BfSendUdpPing8(l, addr)
+	}
 
 	var conv, sn uint32
 	hasConv := false
