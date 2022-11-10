@@ -106,6 +106,8 @@ type (
 		xconn           batchConn // for x/net
 		xconnWriteError error
 
+		FnOutOfBandPing TOutOfBandPing
+
 		mu sync.Mutex
 	}
 
@@ -258,6 +260,9 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 		}
 	}
 }
+func (s *UDPSession) WriteOutOfBand(b []byte) (n int, err error) {
+	return s.conn.WriteTo(b, s.remote)
+}
 
 // Write implements net.Conn
 func (s *UDPSession) Write(b []byte) (n int, err error) { return s.WriteBuffers([][]byte{b}) }
@@ -305,6 +310,7 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 		var c <-chan time.Time
 		if !s.wd.IsZero() {
 			if time.Now().After(s.wd) {
+				//写超时
 				s.mu.Unlock()
 				return 0, errors.WithStack(errTimeout)
 			}
@@ -651,6 +657,10 @@ func (s *UDPSession) notifyWriteError(err error) {
 
 // packet input stage
 func (s *UDPSession) packetInput(data []byte) {
+	if len(data) == 16 {
+		go ClientOutOfBandPing(data, s)
+		return
+	}
 	decrypted := false
 	if s.block != nil && len(data) >= cryptHeaderSize {
 		s.block.Decrypt(data, data)
@@ -785,11 +795,18 @@ type (
 		socketReadErrorOnce sync.Once
 
 		rd atomic.Value // read deadline for Accept()
+
+		FnOutOfBandPing TOutOfBandPing
 	}
 )
 
 // packet input stage
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
+	if len(data) == 16 {
+		go ListenerOutOfBandPing(data, addr, l)
+		//len = 16 is not a valid kcp packet
+		return
+	}
 	decrypted := false
 	if l.block != nil && len(data) >= cryptHeaderSize {
 		l.block.Decrypt(data, data)
@@ -806,9 +823,14 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	}
 
 	if decrypted && len(data) >= IKCP_OVERHEAD {
+		addrStr := addr.String()
 		l.sessionLock.RLock()
-		s, ok := l.sessions[addr.String()]
+		s, ok := l.sessions[addrStr]
 		l.sessionLock.RUnlock()
+
+		if !ok {
+			BfSendUdpPing8(l, addr)
+		}
 
 		var conv, sn uint32
 		convRecovered := false
@@ -841,7 +863,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 				s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, addr, l.block)
 				s.kcpInput(data)
 				l.sessionLock.Lock()
-				l.sessions[addr.String()] = s
+				l.sessions[addrStr] = s
 				l.sessionLock.Unlock()
 				l.chAccepts <- s
 			}
