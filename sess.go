@@ -49,9 +49,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1164,6 +1166,7 @@ type (
 // It decrypts the packet, demultiplexes by remote address,
 // and dispatches to existing sessions or creates new ones.
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
+	//fmt.Println(time.Now().Format(time.StampMilli), "packetInput", addr.String(), " len:", len(data), " hex:", hex.EncodeToString(data))
 	if len(data) == 16 {
 		go ListenerOutOfBandPing(data, addr, l)
 		//len = 16 is not a valid kcp packet
@@ -1212,12 +1215,63 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	}
 
 	// look for existing session
+	addrStr := addr.String()
 	l.sessionLock.RLock()
-	s, exist := l.sessions[addr.String()]
-	l.sessionLock.RUnlock()
-
+	s, exist := l.sessions[addrStr]
 	if !exist {
-		BfSendUdpPing8(l, addr)
+		//new connection or reconnection
+		var una uint32
+		if len(data) >= IKCP_OVERHEAD {
+			una = binary.LittleEndian.Uint32(data[16:])
+		}
+		if una != 0 {
+			//reconnection
+			conv := binary.LittleEndian.Uint32(data)
+			lastCommaNew := strings.LastIndex(addrStr, ":")
+
+			matchCount := 0
+			var matchSession *UDPSession
+			for ii := range l.sessions {
+				ss := l.sessions[ii]
+				if ss.kcp.conv == conv {
+					oldAddrStr := ss.RemoteAddr().String()
+					lastCommaOld := strings.LastIndex(oldAddrStr, ":")
+
+					if oldAddrStr[:lastCommaOld] != addrStr[:lastCommaNew] {
+						//ip not equal
+						continue
+					}
+					matchSession = ss
+					matchCount++
+				}
+			}
+			l.sessionLock.RUnlock()
+
+			if matchCount == 1 {
+				oldAddr := matchSession.remote
+				l.sessionLock.Lock()
+
+				delete(l.sessions, matchSession.RemoteAddr().String())
+				l.sessions[addrStr] = matchSession
+				matchSession.remote = addr
+				l.sessionLock.Unlock()
+
+				exist = true
+				s = matchSession
+
+				fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
+			} else {
+				fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
+				BfSendUdpPing8(l, addr)
+				return
+			}
+		} else {
+			//new connection, do nothing
+			l.sessionLock.RUnlock()
+			BfSendUdpPing8(l, addr)
+		}
+	} else {
+		l.sessionLock.RUnlock()
 	}
 
 	var conv, sn uint32
@@ -1268,7 +1322,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		}
 		// Close will remove the session from listener's session map,
 		// So we can create a new session with the same addr below.
-		s.Close()
+		_ = s.Close()
 	}
 
 	// The connection does not exist, try to create a new one.
@@ -1382,8 +1436,8 @@ func (l *Listener) AcceptKCP() (*UDPSession, error) {
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (l *Listener) SetDeadline(t time.Time) error {
-	l.SetReadDeadline(t)
-	l.SetWriteDeadline(t)
+	_ = l.SetReadDeadline(t)
+	_ = l.SetWriteDeadline(t)
 	return nil
 }
 
@@ -1523,7 +1577,7 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 	}
 
 	var convid uint32
-	binary.Read(rand.Reader, binary.LittleEndian, &convid)
+	_ = binary.Read(rand.Reader, binary.LittleEndian, &convid)
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, true, udpaddr, block), nil
 }
 
@@ -1540,7 +1594,7 @@ func NewConn3(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parit
 // NewConn2 establishes a session and talks KCP protocol over a packet connection.
 func NewConn2(raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
 	var convid uint32
-	binary.Read(rand.Reader, binary.LittleEndian, &convid)
+	_ = binary.Read(rand.Reader, binary.LittleEndian, &convid)
 	return NewConn3(convid, raddr, block, dataShards, parityShards, conn)
 }
 

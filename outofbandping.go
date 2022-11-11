@@ -3,6 +3,7 @@ package kcp
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 )
 
@@ -34,6 +35,10 @@ type TudpPing struct {
 type TOutOfBandPing = func(pkt *TudpPing)
 
 func (this *TudpPing) Migrate2Session(s *UDPSession) {
+	if this.Session == s {
+		fmt.Println("Migrate2Session: newSession == oldSession")
+		return
+	}
 	if this.Listener == nil {
 		return
 	}
@@ -43,19 +48,29 @@ func (this *TudpPing) Migrate2Session(s *UDPSession) {
 	newAddr := this.Addr
 	newAddrStr := newAddr.String()
 
+	if oldAddrStr == newAddrStr {
+		return
+	}
+
 	this.Listener.sessionLock.Lock()
 	newSession, newOK := this.Listener.sessions[newAddrStr]
 	if newOK {
+		if newSession == oldSession {
+			fmt.Println("Migrate2Session: newSession == oldSession")
+			this.Listener.sessionLock.Unlock()
+			return
+		}
 		newSession.remote = oldAddr
 	}
 
 	oldSession.remote = newAddr
-	this.Listener.sessions[newAddrStr] = s
 	delete(this.Listener.sessions, oldAddrStr)
+	this.Listener.sessions[newAddrStr] = s
 
 	this.Listener.sessionLock.Unlock()
 
-	if newOK {
+	if newOK && newSession != oldSession {
+		newSession.l = nil
 		_ = newSession.Close()
 	}
 }
