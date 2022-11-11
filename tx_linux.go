@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package kcp
@@ -22,6 +23,12 @@ func (s *UDPSession) tx(txqueue []ipv4.Message) {
 	nbytes := 0
 	npkts := 0
 	for len(txqueue) > 0 {
+		//for i := range txqueue {
+		//	msg := txqueue[i]
+		//	for i2 := range msg.Buffers {
+		//		fmt.Println(time.Now().Format(time.StampMilli), "udp write to ", msg.Addr, " data:", hex.EncodeToString(msg.Buffers[i2]))
+		//	}
+		//}
 		if n, err := s.xconn.WriteBatch(txqueue, 0); err == nil {
 			for k := range txqueue[:n] {
 				nbytes += len(txqueue[k].Buffers[0])
