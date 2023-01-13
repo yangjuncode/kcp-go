@@ -1223,6 +1223,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	s, exist := l.sessions[addrStr]
 	if !exist {
 		//new connection or reconnection
+		go BfSendUdpPing8(l, addr)
 		var una uint32
 		if len(data) >= IKCP_OVERHEAD {
 			una = binary.LittleEndian.Uint32(data[16:])
@@ -1265,13 +1266,11 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 				fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
 			} else {
 				fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
-				BfSendUdpPing8(l, addr)
 				return
 			}
 		} else {
 			//new connection, do nothing
 			l.sessionLock.RUnlock()
-			BfSendUdpPing8(l, addr)
 		}
 	} else {
 		l.sessionLock.RUnlock()
