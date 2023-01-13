@@ -806,7 +806,10 @@ type (
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	//fmt.Println(time.Now().Format(time.StampMilli), "packetInput", addr.String(), " len:", len(data), " hex:", hex.EncodeToString(data))
 	if len(data) == 16 {
-		go ListenerOutOfBandPing(data, addr, l)
+		//copy data
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+		go ListenerOutOfBandPing(dataCopy, addr, l)
 		//len = 16 is not a valid kcp packet
 		return
 	}
