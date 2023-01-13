@@ -837,6 +837,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		l.sessionLock.RLock()
 		s, ok := l.sessions[addrStr]
 		if !ok {
+			go BfSendUdpPing8(l, addr)
 			//new connection or reconnection
 			//sn := binary.LittleEndian.Uint32(data[12:])
 			una = binary.LittleEndian.Uint32(data[16:])
