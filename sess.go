@@ -199,6 +199,16 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 // Read implements net.Conn
 func (s *UDPSession) Read(b []byte) (n int, err error) {
+	var timeout *time.Timer
+	// deadline for current reading operation
+	var c <-chan time.Time
+	if !s.rd.IsZero() {
+		delay := time.Until(s.rd)
+		timeout = time.NewTimer(delay)
+		c = timeout.C
+		defer timeout.Stop()
+	}
+
 	for {
 		s.mu.Lock()
 		if len(s.bufptr) > 0 { // copy from buffer into b
@@ -232,27 +242,11 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 			return n, nil
 		}
 
-		// deadline for current reading operation
-		var timeout *time.Timer
-		var c <-chan time.Time
-		if !s.rd.IsZero() {
-			if time.Now().After(s.rd) {
-				s.mu.Unlock()
-				return 0, errors.WithStack(errTimeout)
-			}
-
-			delay := time.Until(s.rd)
-			timeout = time.NewTimer(delay)
-			c = timeout.C
-		}
 		s.mu.Unlock()
 
 		// wait for read event or timeout or error
 		select {
 		case <-s.chReadEvent:
-			if timeout != nil {
-				timeout.Stop()
-			}
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketReadError:
@@ -271,6 +265,15 @@ func (s *UDPSession) Write(b []byte) (n int, err error) { return s.WriteBuffers(
 
 // WriteBuffers write a vector of byte slices to the underlying connection
 func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
+	var timeout *time.Timer
+	var c <-chan time.Time
+	if !s.wd.IsZero() {
+		delay := time.Until(s.wd)
+		timeout = time.NewTimer(delay)
+		c = timeout.C
+		defer timeout.Stop()
+	}
+
 	for {
 		select {
 		case <-s.chSocketWriteError:
@@ -308,25 +311,10 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 			return n, nil
 		}
 
-		var timeout *time.Timer
-		var c <-chan time.Time
-		if !s.wd.IsZero() {
-			if time.Now().After(s.wd) {
-				//写超时
-				s.mu.Unlock()
-				return 0, errors.WithStack(errTimeout)
-			}
-			delay := time.Until(s.wd)
-			timeout = time.NewTimer(delay)
-			c = timeout.C
-		}
 		s.mu.Unlock()
 
 		select {
 		case <-s.chWriteEvent:
-			if timeout != nil {
-				timeout.Stop()
-			}
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketWriteError:
