@@ -361,7 +361,7 @@ func (s *UDPSession) Close() error {
 		s.mu.Unlock()
 
 		if s.l != nil { // belongs to listener
-			s.l.closeSession(s.remote)
+			s.l.closeSession(s.remote, s)
 			return nil
 		} else if s.ownConn { // client socket close
 			return s.conn.Close()
@@ -1031,12 +1031,16 @@ func (l *Listener) Close() error {
 }
 
 // closeSession notify the listener that a session has closed
-func (l *Listener) closeSession(remote net.Addr) (ret bool) {
+func (l *Listener) closeSession(remote net.Addr, s *UDPSession) (ret bool) {
 	l.sessionLock.Lock()
 	defer l.sessionLock.Unlock()
-	if _, ok := l.sessions[remote.String()]; ok {
-		delete(l.sessions, remote.String())
-		return true
+	if ss, ok := l.sessions[remote.String()]; ok {
+		if ss == s {
+			delete(l.sessions, remote.String())
+			return true
+		} else {
+			return false
+		}
 	}
 	return false
 }
