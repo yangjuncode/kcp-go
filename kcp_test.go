@@ -24,8 +24,11 @@ package kcp
 
 import (
 	"container/heap"
+	"encoding/binary"
 	"io"
 	"log/slog"
+	"math"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -161,6 +164,319 @@ func BenchmarkFlush(b *testing.B) {
 		mu.Lock()
 		kcp.flush(IKCP_FLUSH_FULL)
 		mu.Unlock()
+	}
+}
+
+func TestParseAckDirectIndexWithSequenceWrap(t *testing.T) {
+	kcp := NewKCP(1, func([]byte, int) {})
+	kcp.snd_buf = NewRingBuffer[segment](8)
+	kcp.snd_una = math.MaxUint32 - 2
+	kcp.snd_nxt = 2
+
+	sequenceNumbers := []uint32{math.MaxUint32 - 2, math.MaxUint32 - 1, math.MaxUint32, 0, 1}
+	for _, sn := range sequenceNumbers {
+		kcp.snd_buf.Push(segment{sn: sn})
+	}
+
+	kcp.parse_ack(0)
+	for i, sn := range sequenceNumbers {
+		seg, ok := kcp.snd_buf.At(i)
+		if !ok {
+			t.Fatalf("missing segment at index %d", i)
+		}
+		want := uint32(0)
+		if sn == 0 {
+			want = 1
+		}
+		if seg.acked != want {
+			t.Fatalf("segment %d acked=%d, want %d", sn, seg.acked, want)
+		}
+	}
+
+	// Old, future, and duplicate ACKs must not affect another segment.
+	kcp.parse_ack(math.MaxUint32 - 3)
+	kcp.parse_ack(2)
+	kcp.parse_ack(0)
+	for i, sn := range sequenceNumbers {
+		seg, _ := kcp.snd_buf.At(i)
+		if (sn == 0) != (seg.acked == 1) {
+			t.Fatalf("unexpected ACK state for segment %d: %d", sn, seg.acked)
+		}
+	}
+}
+
+func TestInputAggregatesFastAckPerDatagram(t *testing.T) {
+	kcp := newFastAckTestKCP(6, 100)
+	packet := appendAck(nil, kcp.conv, 3, 100, 0)
+	packet = appendAck(packet, kcp.conv, 5, 100, 0)
+
+	if ret := kcp.Input(packet, IKCP_PACKET_FEC, false); ret != 0 {
+		t.Fatalf("Input returned %d", ret)
+	}
+	kcp.applyFastAcks()
+
+	for i := range 6 {
+		seg, _ := kcp.snd_buf.At(i)
+		wantFastAck := uint32(0)
+		if i < 5 {
+			wantFastAck = 1
+		}
+		if seg.fastack != wantFastAck {
+			t.Fatalf("segment %d fastack=%d, want %d", i, seg.fastack, wantFastAck)
+		}
+	}
+}
+
+func TestInputKeepsTimestampPairedWithMaxAck(t *testing.T) {
+	kcp := newFastAckTestKCP(6, 200)
+	packet := appendAck(nil, kcp.conv, 5, 100, 0)
+	packet = appendAck(packet, kcp.conv, 4, 300, 0)
+
+	if ret := kcp.Input(packet, IKCP_PACKET_FEC, false); ret != 0 {
+		t.Fatalf("Input returned %d", ret)
+	}
+	kcp.applyFastAcks()
+
+	for i := range 6 {
+		seg, _ := kcp.snd_buf.At(i)
+		if seg.fastack != 0 {
+			t.Fatalf("segment %d fastack=%d, want 0", i, seg.fastack)
+		}
+	}
+}
+
+func TestApplyFastAcksMatchesScalarAlgorithm(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	for iteration := range 100 {
+		const segmentCount = 257
+		baseSN := uint32(math.MaxUint32 - 128 + iteration)
+		baseTS := uint32(math.MaxUint32 - 500 + iteration)
+		kcp := NewKCP(1, func([]byte, int) {})
+		kcp.snd_buf = NewRingBuffer[segment](segmentCount + 1)
+		kcp.snd_una = baseSN
+		kcp.snd_nxt = baseSN + segmentCount
+
+		expected := make([]uint32, segmentCount)
+		for i := range segmentCount {
+			fastack := uint32(rng.Intn(4))
+			if i%41 == 0 {
+				fastack = math.MaxUint32
+			}
+			ts := baseTS + uint32(rng.Intn(1000))
+			kcp.snd_buf.Push(segment{sn: baseSN + uint32(i), ts: ts, fastack: fastack})
+			expected[i] = fastack
+		}
+
+		for range 173 {
+			ack := ackItem{
+				sn: baseSN + uint32(rng.Intn(segmentCount)),
+				ts: baseTS + uint32(rng.Intn(1000)),
+			}
+			kcp.fastackEvents = append(kcp.fastackEvents, ack)
+			for i := range segmentCount {
+				seg, _ := kcp.snd_buf.At(i)
+				if expected[i] != math.MaxUint32 &&
+					_itimediff(ack.sn, seg.sn) > 0 && _itimediff(seg.ts, ack.ts) <= 0 {
+					expected[i]++
+				}
+			}
+		}
+
+		kcp.applyFastAcks()
+		if len(kcp.fastackEvents) != 0 {
+			t.Fatalf("iteration %d left %d pending fast ACKs", iteration, len(kcp.fastackEvents))
+		}
+		for i, want := range expected {
+			seg, _ := kcp.snd_buf.At(i)
+			if seg.fastack != want {
+				t.Fatalf("iteration %d segment %d fastack=%d, want %d", iteration, i, seg.fastack, want)
+			}
+		}
+	}
+}
+
+func TestWindowFlushOnlyVisitsNewSegments(t *testing.T) {
+	var sent []uint32
+	kcp := NewKCP(1, func(buf []byte, size int) {
+		for len(buf) >= IKCP_OVERHEAD && size >= IKCP_OVERHEAD {
+			length := int(binary.LittleEndian.Uint32(buf[20:]))
+			segmentSize := IKCP_OVERHEAD + length
+			if segmentSize > size || segmentSize > len(buf) {
+				t.Fatalf("invalid output segment size %d", segmentSize)
+			}
+			if buf[4] == IKCP_CMD_PUSH {
+				sent = append(sent, binary.LittleEndian.Uint32(buf[12:]))
+			}
+			buf = buf[segmentSize:]
+			size -= segmentSize
+		}
+	})
+	kcp.nocwnd = 1
+	kcp.snd_wnd = 4
+	kcp.rmt_wnd = 4
+	kcp.snd_una = 0
+	kcp.snd_nxt = 2
+	kcp.snd_buf.Push(segment{sn: 0, xmit: 1, resendts: 0})
+	kcp.snd_buf.Push(segment{sn: 1, xmit: 1, resendts: 0})
+	kcp.snd_queue.Push(segment{})
+	kcp.snd_queue.Push(segment{})
+
+	kcp.flush(ikcpFlushWindow)
+
+	if len(sent) != 2 || sent[0] != 2 || sent[1] != 3 {
+		t.Fatalf("sent sequence numbers %v, want [2 3]", sent)
+	}
+	for i, wantXmit := range []uint32{1, 1, 1, 1} {
+		seg, _ := kcp.snd_buf.At(i)
+		if seg.xmit != wantXmit {
+			t.Fatalf("segment %d xmit=%d, want %d", i, seg.xmit, wantXmit)
+		}
+	}
+}
+
+func TestDeferredFastAckTriggersRetransmit(t *testing.T) {
+	var sent []uint32
+	kcp := NewKCP(1, func(buf []byte, size int) {
+		for len(buf) >= IKCP_OVERHEAD && size >= IKCP_OVERHEAD {
+			length := int(binary.LittleEndian.Uint32(buf[20:]))
+			segmentSize := IKCP_OVERHEAD + length
+			if buf[4] == IKCP_CMD_PUSH {
+				sent = append(sent, binary.LittleEndian.Uint32(buf[12:]))
+			}
+			buf = buf[segmentSize:]
+			size -= segmentSize
+		}
+	})
+	kcp.fastresend = 2
+	kcp.nocwnd = 1
+	kcp.snd_una = 0
+	kcp.snd_nxt = 3
+	kcp.snd_buf = NewRingBuffer[segment](4)
+	for sn := range 3 {
+		kcp.snd_buf.Push(segment{
+			conv:     kcp.conv,
+			cmd:      IKCP_CMD_PUSH,
+			sn:       uint32(sn),
+			ts:       100,
+			xmit:     1,
+			resendts: currentMs() + 60_000,
+		})
+	}
+
+	packet := appendAck(nil, kcp.conv, 2, 100, 0)
+	if ret := kcp.Input(packet, IKCP_PACKET_FEC, false); ret != 0 {
+		t.Fatalf("first Input returned %d", ret)
+	}
+	if ret := kcp.Input(packet, IKCP_PACKET_FEC, false); ret != 0 {
+		t.Fatalf("second Input returned %d", ret)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("Input sent retransmissions before the timer flush: %v", sent)
+	}
+
+	kcp.applyFastAcks()
+	for i := range 2 {
+		seg, _ := kcp.snd_buf.At(i)
+		if seg.fastack != 2 {
+			t.Fatalf("segment %d fastack=%d, want 2", i, seg.fastack)
+		}
+	}
+	kcp.flush(IKCP_FLUSH_FULL)
+	for i := range 2 {
+		seg, _ := kcp.snd_buf.At(i)
+		if seg.xmit != 2 {
+			t.Fatalf("segment %d xmit=%d after flush, want 2", i, seg.xmit)
+		}
+	}
+	if len(sent) != 2 || sent[0] != 0 || sent[1] != 1 {
+		t.Fatalf("retransmitted sequence numbers %v, want [0 1]", sent)
+	}
+}
+
+func BenchmarkParseAck(b *testing.B) {
+	for _, size := range []int{4096, 18000, 36000} {
+		b.Run(stringSize(size), func(b *testing.B) {
+			kcp := newFastAckTestKCP(size, 100)
+			target := uint32(size - 1)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				kcp.parse_ack(target)
+			}
+		})
+	}
+}
+
+func BenchmarkInputAckBatch18K(b *testing.B) {
+	kcp := newFastAckTestKCP(18000, 100)
+	kcp.fastresend = math.MaxInt32
+	packet := make([]byte, 0, 58*IKCP_OVERHEAD)
+	for sn := uint32(17942); sn < 18000; sn++ {
+		packet = appendAck(packet, kcp.conv, sn, 100, 0)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if ret := kcp.Input(packet, IKCP_PACKET_FEC, false); ret != 0 {
+			b.Fatalf("Input returned %d", ret)
+		}
+		kcp.fastackEvents = kcp.fastackEvents[:0]
+	}
+}
+
+func BenchmarkApplyFastAcks18K(b *testing.B) {
+	kcp := newFastAckTestKCP(18000, 100)
+	events := make([]ackItem, 100)
+	for i := range events {
+		events[i] = ackItem{sn: uint32(17900 + i), ts: 100}
+	}
+	// Warm the reusable sorting and Fenwick buffers before measuring.
+	kcp.fastackEvents = append(kcp.fastackEvents, events...)
+	kcp.applyFastAcks()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		kcp.fastackEvents = append(kcp.fastackEvents, events...)
+		kcp.applyFastAcks()
+	}
+}
+
+func newFastAckTestKCP(size int, ts uint32) *KCP {
+	kcp := NewKCP(1, func([]byte, int) {})
+	kcp.snd_buf = NewRingBuffer[segment](size + 1)
+	kcp.snd_una = 0
+	kcp.snd_nxt = uint32(size)
+	kcp.fastresend = 10
+	for sn := range size {
+		kcp.snd_buf.Push(segment{sn: uint32(sn), ts: ts})
+	}
+	return kcp
+}
+
+func appendAck(dst []byte, conv, sn, ts, una uint32) []byte {
+	start := len(dst)
+	dst = append(dst, make([]byte, IKCP_OVERHEAD)...)
+	binary.LittleEndian.PutUint32(dst[start:], conv)
+	dst[start+4] = IKCP_CMD_ACK
+	binary.LittleEndian.PutUint16(dst[start+6:], uint16(IKCP_WND_RCV))
+	binary.LittleEndian.PutUint32(dst[start+8:], ts)
+	binary.LittleEndian.PutUint32(dst[start+12:], sn)
+	binary.LittleEndian.PutUint32(dst[start+16:], una)
+	return dst
+}
+
+func stringSize(size int) string {
+	switch size {
+	case 4096:
+		return "4K"
+	case 18000:
+		return "18K"
+	case 36000:
+		return "36K"
+	default:
+		panic("unexpected benchmark size")
 	}
 }
 

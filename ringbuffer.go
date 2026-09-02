@@ -90,6 +90,19 @@ func (r *RingBuffer[T]) Peek() (*T, bool) {
 	return &r.elements[r.head], true
 }
 
+// At returns the element at logical index i, where index 0 is the head.
+func (r *RingBuffer[T]) At(i int) (*T, bool) {
+	if i < 0 || i >= r.Len() {
+		return nil, false
+	}
+
+	index := r.head + i
+	if index >= len(r.elements) {
+		index -= len(r.elements)
+	}
+	return &r.elements[index], true
+}
+
 // Discard discards the first N elements from the ring buffer.
 // Returns the number of elements that are actually discarded (<= n).
 func (r *RingBuffer[T]) Discard(n int) int {

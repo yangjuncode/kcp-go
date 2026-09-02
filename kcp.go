@@ -25,6 +25,7 @@ package kcp
 import (
 	"container/heap"
 	"encoding/binary"
+	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -77,6 +78,8 @@ const (
 	IKCP_FLUSH_ACKONLY FlushType = 1 << iota
 	IKCP_FLUSH_FULL
 )
+
+const ikcpFlushWindow FlushType = 1 << 2
 
 type KCPLogType int32
 
@@ -240,6 +243,14 @@ type KCP struct {
 	rcv_buf   *segmentHeap         // receive buffer: out-of-order segments awaiting reordering
 
 	acklist []ackItem // pending ACKs to be flushed
+
+	// Fast ACK events are collected by Input and applied once by the timer
+	// update. The scratch buffers keep that batch processing allocation-free
+	// after reaching the steady-state high-water mark.
+	fastackEvents  []ackItem
+	fastackBySN    []ackItem
+	fastackTS      []uint32
+	fastackFenwick []uint32
 
 	buffer []byte          // pre-allocated encoding buffer for flush()
 	output output_callback // callback to write data to the underlying transport
@@ -486,44 +497,148 @@ func (kcp *KCP) parse_ack(sn uint32) {
 		return
 	}
 
+	// snd_buf contains the contiguous sequence range starting at snd_una,
+	// including acknowledged holes that have not yet been covered by UNA.
+	// Use that invariant to locate the segment without scanning the window.
+	seg, ok := kcp.snd_buf.At(int(sn - kcp.snd_una))
+	if !ok || seg.sn != sn || seg.acked != 0 {
+		return
+	}
+
+	// Leave the segment in place until UNA advances so later sequence numbers
+	// retain their direct index. Recycle only its payload immediately.
+	seg.acked = 1
+	kcp.recycleSegment(seg)
+}
+
+// queueFastAck defers fast-ack accounting to the timer update. Input runs while
+// holding the session mutex, so keeping this path O(1) prevents ACK processing
+// from starving writers on large send windows.
+func (kcp *KCP) queueFastAck(sn, ts uint32) {
+	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
+		return
+	}
+	kcp.fastackEvents = append(kcp.fastackEvents, ackItem{sn: sn, ts: ts})
+}
+
+// applyFastAcks applies all ACK events collected since the previous timer
+// update. It computes the number of events satisfying both KCP fast-ack rules:
+// ack.sn > seg.sn and ack.ts >= seg.ts. A Fenwick tree over ACK timestamps turns
+// the per-event linear scans into O((segments+acks)*log(acks)).
+func (kcp *KCP) applyFastAcks() bool {
+	if len(kcp.fastackEvents) == 0 {
+		return false
+	}
+
+	baseSN := kcp.snd_una
+	events := kcp.fastackBySN[:0]
+	for _, ack := range kcp.fastackEvents {
+		if _itimediff(ack.sn, baseSN) >= 0 && _itimediff(ack.sn, kcp.snd_nxt) < 0 {
+			events = append(events, ack)
+		}
+	}
+	kcp.fastackEvents = kcp.fastackEvents[:0]
+	kcp.fastackBySN = events
+	if len(events) == 0 {
+		return false
+	}
+
+	slices.SortFunc(events, func(a, b ackItem) int {
+		return int(_itimediff(a.sn, b.sn))
+	})
+
+	timestamps := kcp.fastackTS[:0]
+	for _, ack := range events {
+		timestamps = append(timestamps, ack.ts)
+	}
+	slices.SortFunc(timestamps, func(a, b uint32) int {
+		return int(_itimediff(a, b))
+	})
+	unique := timestamps[:0]
+	for _, ts := range timestamps {
+		if len(unique) == 0 || ts != unique[len(unique)-1] {
+			unique = append(unique, ts)
+		}
+	}
+	kcp.fastackTS = unique
+
+	needed := len(unique) + 1
+	if cap(kcp.fastackFenwick) < needed {
+		kcp.fastackFenwick = make([]uint32, needed)
+	} else {
+		kcp.fastackFenwick = kcp.fastackFenwick[:needed]
+		clear(kcp.fastackFenwick)
+	}
+	for _, ack := range events {
+		kcp.fastackFenwickAdd(kcp.fastackTimestampIndex(ack.ts), 1)
+	}
+
+	active := uint32(len(events))
+	nextEvent := 0
+	shouldFastAck := false
 	for seg := range kcp.snd_buf.ForEach {
-		if sn == seg.sn {
-			// mark and free space, but leave the segment here,
-			// and wait until `una` to delete this, then we don't
-			// have to shift the segments behind forward,
-			// which is an expensive operation for large window
-			seg.acked = 1
-			kcp.recycleSegment(seg)
+		for nextEvent < len(events) && _itimediff(events[nextEvent].sn, seg.sn) <= 0 {
+			kcp.fastackFenwickAdd(kcp.fastackTimestampIndex(events[nextEvent].ts), -1)
+			active--
+			nextEvent++
+		}
+		if active == 0 {
 			break
 		}
-		if _itimediff(sn, seg.sn) < 0 {
-			break
+		if seg.fastack == mathMaxUint32 {
+			continue
+		}
+
+		firstEligibleTS := fastackTimestampLowerBound(unique, seg.ts)
+		count := active - kcp.fastackFenwickSum(firstEligibleTS)
+		if mathMaxUint32-seg.fastack < count {
+			seg.fastack = mathMaxUint32
+		} else {
+			seg.fastack += count
+		}
+		if kcp.fastresend > 0 && seg.fastack >= uint32(kcp.fastresend) {
+			shouldFastAck = true
+		}
+	}
+	return shouldFastAck
+}
+
+const mathMaxUint32 = ^uint32(0)
+
+func (kcp *KCP) fastackTimestampIndex(ts uint32) int {
+	return fastackTimestampLowerBound(kcp.fastackTS, ts)
+}
+
+func fastackTimestampLowerBound(timestamps []uint32, target uint32) int {
+	left, right := 0, len(timestamps)
+	for left < right {
+		middle := int(uint(left+right) >> 1)
+		if _itimediff(timestamps[middle], target) < 0 {
+			left = middle + 1
+		} else {
+			right = middle
+		}
+	}
+	return left
+}
+
+func (kcp *KCP) fastackFenwickAdd(index int, delta int) {
+	for i := index + 1; i < len(kcp.fastackFenwick); i += i & -i {
+		if delta > 0 {
+			kcp.fastackFenwick[i]++
+		} else {
+			kcp.fastackFenwick[i]--
 		}
 	}
 }
 
-// parse_fastack increments the fast-ack counter for segments with sn < the given sn.
-// Returns 1 if any segment's fastack counter has reached the fast retransmit threshold.
-func (kcp *KCP) parse_fastack(sn, ts uint32) int {
-	shouldFastAck := 0
-	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
-		return 0
+// fastackFenwickSum returns the count in timestamp indexes [0, end).
+func (kcp *KCP) fastackFenwickSum(end int) uint32 {
+	var sum uint32
+	for i := end; i > 0; i -= i & -i {
+		sum += kcp.fastackFenwick[i]
 	}
-
-	for seg := range kcp.snd_buf.ForEach {
-		if _itimediff(sn, seg.sn) < 0 {
-			break
-		} else if sn != seg.sn && _itimediff(seg.ts, ts) <= 0 {
-			if seg.fastack != 0xFFFFFFFF {
-				seg.fastack++
-				if seg.fastack >= uint32(kcp.fastresend) {
-					shouldFastAck = 1
-				}
-			}
-		}
-	}
-
-	return shouldFastAck
+	return sum
 }
 
 // parse_una removes all segments from snd_buf that have been cumulatively acknowledged
@@ -596,8 +711,10 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		return -1
 	}
 
-	var latest uint32 // the latest ack packet
-	var updateRTT int
+	var latest uint32 // timestamp of the last ACK, used for the RTT sample
+	var maxAck uint32 // highest ACK sequence number in this datagram
+	var maxAckTS uint32
+	var hasAck bool
 	var inSegs uint64
 	var flushSegments int // signal to flush segments
 
@@ -645,8 +762,11 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		case IKCP_CMD_ACK:
 			kcp.debugLog(IKCP_LOG_IN_ACK, "conv", conv, "sn", sn, "una", una, "ts", ts, "rto", kcp.rx_rto)
 			kcp.parse_ack(sn)
-			flushSegments |= kcp.parse_fastack(sn, ts)
-			updateRTT |= 1
+			if !hasAck || _itimediff(sn, maxAck) > 0 {
+				maxAck = sn
+				maxAckTS = ts
+			}
+			hasAck = true
 			latest = ts
 		case IKCP_CMD_PUSH:
 			repeat := true
@@ -679,10 +799,15 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		data = data[length:]
 	}
 	atomic.AddUint64(&DefaultSnmp.InSegs, inSegs)
+	if hasAck {
+		// Classic KCP applies fastack once for the highest ACK in a datagram.
+		// Defer the actual accounting so Input remains independent of snd_buf size.
+		kcp.queueFastAck(maxAck, maxAckTS)
+	}
 
 	// update rtt with the latest ts
 	// ignore the FEC packet
-	if updateRTT != 0 && pktType == IKCP_PACKET_REGULAR {
+	if hasAck && pktType == IKCP_PACKET_REGULAR {
 		current := currentMs()
 		if _itimediff(current, latest) >= 0 {
 			kcp.update_ack(_itimediff(current, latest))
@@ -721,11 +846,9 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 
 	// Determine if we need to flush data segments or acks
 	if flushSegments != 0 {
-		// If window has slided or, a fastack should be triggered,
-		// Flush immediately. In previous implementations, we only
-		// send out fastacks when interval timeouts, so the resending packets
-		// have to wait until then. Now, we try to flush as soon as we can.
-		kcp.flush(IKCP_FLUSH_FULL)
+		// Refill a send window that advanced through UNA without scanning old
+		// in-flight segments. Fast ACK events are handled by the timer update.
+		kcp.flush(ikcpFlushWindow)
 	} else if len(kcp.acklist) >= int(kcp.mtu/IKCP_OVERHEAD) { // clocking
 		// This serves as the clock for low-latency network.(i.e. the latency is less than the interval.)
 		// If the other end is waiting for confirmations, it has to want until the interval timeouts then
@@ -752,7 +875,7 @@ func (kcp *KCP) wnd_unused() uint16 {
 //	Phase 2: Window probing (when remote window is zero)
 //	Phase 3: Send window probe commands (WASK/WINS)
 //	Phase 4: Move segments from snd_queue to snd_buf (sliding window)
-//	Phase 5: Retransmit segments (initial, fast, early, RTO)
+//	Phase 5: Transmit new segments and, for full flushes, retransmit old ones
 //	Phase 6: Update SNMP counters and congestion window
 //
 // Returns the suggested interval (ms) until the next flush call.
@@ -791,7 +914,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	}()
 
 	// --- Phase 1: Flush pending ACKs ---
-	if flushType == IKCP_FLUSH_ACKONLY || flushType == IKCP_FLUSH_FULL {
+	if flushType == IKCP_FLUSH_ACKONLY || flushType == ikcpFlushWindow || flushType == IKCP_FLUSH_FULL {
 		for i, ack := range kcp.acklist {
 			makeSpace(IKCP_OVERHEAD)
 			// filter jitters caused by bufferbloat
@@ -888,8 +1011,16 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
 	nextUpdate = kcp.interval
 
-	if flushType == IKCP_FLUSH_FULL {
-		for segment := range kcp.snd_buf.ForEach {
+	if flushType == ikcpFlushWindow || flushType == IKCP_FLUSH_FULL {
+		start := 0
+		if flushType == ikcpFlushWindow {
+			start = kcp.snd_buf.Len() - newSegsCount
+		}
+		for i := start; i < kcp.snd_buf.Len(); i++ {
+			segment, ok := kcp.snd_buf.At(i)
+			if !ok {
+				break
+			}
 			needsend := false
 			if segment.acked == 1 {
 				continue
@@ -898,21 +1029,21 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				needsend = true
 				segment.rto = kcp.rx_rto
 				segment.resendts = current + segment.rto
-			} else if segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
+			} else if flushType == IKCP_FLUSH_FULL && segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
 				needsend = true
 				segment.fastack = 0xFFFFFFFF // must wait until RTO to reset
 				segment.rto = kcp.rx_rto
 				segment.resendts = current + segment.rto
 				change++
 				fastRetransSegs++
-			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
+			} else if flushType == IKCP_FLUSH_FULL && segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
 				needsend = true
 				segment.fastack = 0xFFFFFFFF
 				segment.rto = kcp.rx_rto
 				segment.resendts = current + segment.rto
 				change++
 				earlyRetransSegs++
-			} else if _itimediff(current, segment.resendts) >= 0 { // RTO
+			} else if flushType == IKCP_FLUSH_FULL && _itimediff(current, segment.resendts) >= 0 { // RTO
 				needsend = true
 				if kcp.nodelay == 0 {
 					segment.rto += kcp.rx_rto
@@ -1014,6 +1145,15 @@ func (kcp *KCP) Update() {
 	if slap >= 10000 || slap < -10000 {
 		kcp.ts_flush = current
 		slap = 0
+	}
+
+	fastAckPending := len(kcp.fastackEvents) > 0
+	if fastAckPending {
+		kcp.applyFastAcks()
+		if slap < 0 {
+			// Fast-ack wakeups must not wait for the regular interval timer.
+			kcp.flush(IKCP_FLUSH_FULL)
+		}
 	}
 
 	if slap >= 0 {
