@@ -1224,52 +1224,60 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	if !exist {
 		//new connection or reconnection
 		go BfSendUdpPing8(l, addr)
-		var una uint32
-		if len(data) >= IKCP_OVERHEAD {
-			una = binary.LittleEndian.Uint32(data[16:])
-		}
-		if una != 0 {
-			//reconnection
-			conv := binary.LittleEndian.Uint32(data)
-			lastCommaNew := strings.LastIndex(addrStr, ":")
 
-			matchCount := 0
-			var matchSession *UDPSession
-			for ii := range l.sessions {
-				ss := l.sessions[ii]
-				if ss.kcp.conv == conv {
-					oldAddrStr := ss.RemoteAddr().String()
-					lastCommaOld := strings.LastIndex(oldAddrStr, ":")
-
-					if oldAddrStr[:lastCommaOld] != addrStr[:lastCommaNew] {
-						//ip not equal
-						continue
-					}
-					matchSession = ss
-					matchCount++
-				}
+		// 重连恢复逻辑仅对非 FEC 包生效（FEC/OOB 包的 conv/una 字段偏移不同）
+		fecFlagEarly := binary.LittleEndian.Uint16(data[4:])
+		if fecFlagEarly != typeData && fecFlagEarly != typeParity && fecFlagEarly != typeOOB {
+			var una uint32
+			if len(data) >= IKCP_OVERHEAD {
+				una = binary.LittleEndian.Uint32(data[16:])
 			}
-			l.sessionLock.RUnlock()
+			if una != 0 {
+				//reconnection
+				conv := binary.LittleEndian.Uint32(data)
+				lastCommaNew := strings.LastIndex(addrStr, ":")
 
-			if matchCount == 1 {
-				oldAddr := matchSession.remote
-				l.sessionLock.Lock()
+				matchCount := 0
+				var matchSession *UDPSession
+				for ii := range l.sessions {
+					ss := l.sessions[ii]
+					if ss.kcp.conv == conv {
+						oldAddrStr := ss.RemoteAddr().String()
+						lastCommaOld := strings.LastIndex(oldAddrStr, ":")
 
-				delete(l.sessions, matchSession.RemoteAddr().String())
-				l.sessions[addrStr] = matchSession
-				matchSession.remote = addr
-				l.sessionLock.Unlock()
+						if oldAddrStr[:lastCommaOld] != addrStr[:lastCommaNew] {
+							//ip not equal
+							continue
+						}
+						matchSession = ss
+						matchCount++
+					}
+				}
+				l.sessionLock.RUnlock()
 
-				exist = true
-				s = matchSession
+				if matchCount == 1 {
+					oldAddr := matchSession.remote
+					l.sessionLock.Lock()
 
-				fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
+					delete(l.sessions, matchSession.RemoteAddr().String())
+					l.sessions[addrStr] = matchSession
+					matchSession.remote = addr
+					l.sessionLock.Unlock()
+
+					exist = true
+					s = matchSession
+
+					fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
+				} else {
+					fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
+					return
+				}
 			} else {
-				fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
-				return
+				//new connection, do nothing
+				l.sessionLock.RUnlock()
 			}
 		} else {
-			//new connection, do nothing
+			//FEC or OOB packet, skip reconnection logic
 			l.sessionLock.RUnlock()
 		}
 	} else {
