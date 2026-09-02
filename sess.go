@@ -997,7 +997,10 @@ func (s *UDPSession) packetInput(data []byte) {
 	// 返回后 readLoop 会立即读下一个包覆盖 buffer。如果直接把 data 传给
 	// 异步 goroutine，goroutine 可能读到被覆盖的数据（数据竞争）。
 	// 所以必须先 copy 到独立 buffer 再传给 goroutine。
-	if len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
+	//
+	// 优化：如果用户未设置 FnOutOfBandPing 回调，跳过整个拦截，
+	// 避免不必要的 bytes.HasPrefix 检查和 goroutine 创建开销。
+	if s.FnOutOfBandPing != nil && len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
 		dataCopy := make([]byte, len(data))
 		copy(dataCopy, data)
 		go ClientOutOfBandPing(dataCopy, s)
@@ -1196,7 +1199,10 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	// out-of-band ping 包拦截：与 UDPSession.packetInput 中的逻辑相同。
 	// 16 字节 + 前缀匹配才拦截，避免误丢其他 16 字节合法包。
 	// copy data 原因同上：readLoop buffer 复用，异步 goroutine 需要独立 buffer。
-	if len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
+	//
+	// 优化：如果用户未设置 FnOutOfBandPing 回调，跳过整个拦截，
+	// 避免不必要的 bytes.HasPrefix 检查和 goroutine 创建开销。
+	if l.FnOutOfBandPing != nil && len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
 		dataCopy := make([]byte, len(data))
 		copy(dataCopy, data)
 		go ListenerOutOfBandPing(dataCopy, addr, l)
@@ -1249,23 +1255,29 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	l.sessionLock.RLock()
 	s, exist := l.sessions[addrStr]
 	if !exist {
-		// 收到来自未知地址的包，可能是新连接或重连。
-		// 异步发送 cmd=8 ping 包，通知客户端触发重连流程。
-		go BfSendUdpPing8(l, addr)
+		// 优化：如果用户未设置 FnOutOfBandPing 回调，跳过所有 out-of-band ping
+		// 相关处理（ping8 发送 + 重连逻辑），直接走正常建连流程。
+		// 这样在未启用 ping 功能时，代码行为与上游原版完全一致，无额外开销。
+		if l.FnOutOfBandPing == nil {
+			l.sessionLock.RUnlock()
+		} else {
+			// 收到来自未知地址的包，可能是新连接或重连。
+			// 异步发送 cmd=8 ping 包，通知客户端触发重连流程。
+			go BfSendUdpPing8(l, addr)
 
-		// 重连恢复逻辑仅对非 FEC 包生效。
-		//
-		// 为什么需要检查 fecFlagEarly：
-		// 重连逻辑读取 data[0:](conv) 和 data[16:](una)，这两个偏移只对
-		// 非 FEC 的裸 KCP 包正确。FEC 包（typeData/typeParity）的 conv 在
-		// fecHeaderSizePlus2 偏移处，OOB 包（typeOOB）的 conv 也在不同位置。
-		// 如果对 FEC 包应用重连逻辑，会读到垃圾值，误判为重连并丢包。
-		// rebase 时发现此问题导致测试超时，故加此检查。
-		//
-		// fecFlag 正确性：非 FEC KCP 包的 data[4:5] 是 cmd(81-84)，
-		// data[5:6] 是 frg(0-255)，组合成 uint16 不可能等于 0xf1/0xf2/0xf3。
-		fecFlagEarly := binary.LittleEndian.Uint16(data[4:])
-		if fecFlagEarly != typeData && fecFlagEarly != typeParity && fecFlagEarly != typeOOB {
+			// 重连恢复逻辑仅对非 FEC 包生效。
+			//
+			// 为什么需要检查 fecFlagEarly：
+			// 重连逻辑读取 data[0:](conv) 和 data[16:](una)，这两个偏移只对
+			// 非 FEC 的裸 KCP 包正确。FEC 包（typeData/typeParity）的 conv 在
+			// fecHeaderSizePlus2 偏移处，OOB 包（typeOOB）的 conv 也在不同位置。
+			// 如果对 FEC 包应用重连逻辑，会读到垃圾值，误判为重连并丢包。
+			// rebase 时发现此问题导致测试超时，故加此检查。
+			//
+			// fecFlag 正确性：非 FEC KCP 包的 data[4:5] 是 cmd(81-84)，
+			// data[5:6] 是 frg(0-255)，组合成 uint16 不可能等于 0xf1/0xf2/0xf3。
+			fecFlagEarly := binary.LittleEndian.Uint16(data[4:])
+			if fecFlagEarly != typeData && fecFlagEarly != typeParity && fecFlagEarly != typeOOB {
 			// 非 FEC 包，读取 KCP 头中的 una 字段（offset 16，4 字节）
 			var una uint32
 			if len(data) >= IKCP_OVERHEAD {
@@ -1333,6 +1345,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 			// FEC 或 OOB 包，跳过重连逻辑，释放读锁走正常建连流程
 			l.sessionLock.RUnlock()
 		}
+	} // 关闭 FnOutOfBandPing != nil 的 else 块
 	} else {
 		// 已有 session，释放读锁，继续正常处理
 		l.sessionLock.RUnlock()
