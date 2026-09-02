@@ -1331,7 +1331,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 						// 无法 fast recover，发 ping8 通知客户端触发重连流程，然后丢弃此包。
 						go BfSendUdpPing8(l, addr)
 						if shouldLogReconnect(addrStr) {
-							fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
+							fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored send outofbandping 8", addr.String())
 						}
 						return
 					}
