@@ -204,6 +204,42 @@ func TestRingBufferGrow(t *testing.T) {
 	}
 }
 
+func TestRingBufferAt(t *testing.T) {
+	r := NewRingBuffer[int](8)
+	for i := range 7 {
+		r.Push(i)
+	}
+	for range 5 {
+		r.Pop()
+	}
+	for i := 7; i < 11; i++ {
+		r.Push(i)
+	}
+
+	for i, want := range []int{5, 6, 7, 8, 9, 10} {
+		got, ok := r.At(i)
+		if !ok || *got != want {
+			t.Fatalf("At(%d) = %v, %v; want %d, true", i, got, ok, want)
+		}
+	}
+	if _, ok := r.At(-1); ok {
+		t.Fatal("At(-1) unexpectedly succeeded")
+	}
+	if _, ok := r.At(r.Len()); ok {
+		t.Fatalf("At(%d) unexpectedly succeeded", r.Len())
+	}
+
+	// Trigger growth while wrapped and verify logical indexing remains stable.
+	r.Push(11)
+	r.Push(12)
+	for i, want := range []int{5, 6, 7, 8, 9, 10, 11, 12} {
+		got, ok := r.At(i)
+		if !ok || *got != want {
+			t.Fatalf("At(%d) after growth = %v, %v; want %d, true", i, got, ok, want)
+		}
+	}
+}
+
 func TestRingForEach(t *testing.T) {
 	r := NewRingBuffer[int](10)
 	for i := range 10 {

@@ -71,6 +71,28 @@ func nextPort() int {
 	return port
 }
 
+func TestSetFastAckDelay(t *testing.T) {
+	sess := &UDPSession{fastAckDelay: defaultFastAckDelay}
+	if sess.fastAckDelay != 20*time.Millisecond {
+		t.Fatalf("default fast ACK delay = %v, want 20ms", sess.fastAckDelay)
+	}
+
+	sess.SetFastAckDelay(7 * time.Millisecond)
+	if sess.fastAckDelay != 7*time.Millisecond {
+		t.Fatalf("configured fast ACK delay = %v, want 7ms", sess.fastAckDelay)
+	}
+
+	sess.SetFastAckDelay(0)
+	if sess.fastAckDelay != defaultFastAckDelay {
+		t.Fatalf("zero fast ACK delay = %v, want default %v", sess.fastAckDelay, defaultFastAckDelay)
+	}
+
+	sess.SetFastAckDelay(-time.Millisecond)
+	if sess.fastAckDelay != defaultFastAckDelay {
+		t.Fatalf("negative fast ACK delay = %v, want default %v", sess.fastAckDelay, defaultFastAckDelay)
+	}
+}
+
 func dialEcho(port int, block BlockCrypt) (*UDPSession, error) {
 	// block, _ := NewNoneBlockCrypt(pass)
 	// block, _ := NewSimpleXORBlockCrypt(pass)

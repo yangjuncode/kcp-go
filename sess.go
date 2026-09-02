@@ -103,6 +103,8 @@ var (
 	errNotOwner         = errors.New("not the owner of this connection")
 )
 
+const defaultFastAckDelay = 20 * time.Millisecond
+
 // timeoutError implements net.Error
 type timeoutError struct{}
 
@@ -138,17 +140,19 @@ type (
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr     // remote peer address
-		rd         atomic.Value // read deadline
-		wd         atomic.Value // write deadline
-		headerSize int          // the header size additional to a KCP frame
-		ackNoDelay bool         // send ack immediately for each incoming packet(testing purpose)
-		writeDelay bool         // delay kcp.flush() for Write() for bulk transfer
-		dup        int          // duplicate udp packets(testing purpose)
+		remote       net.Addr      // remote peer address
+		rd           atomic.Value  // read deadline
+		wd           atomic.Value  // write deadline
+		headerSize   int           // the header size additional to a KCP frame
+		ackNoDelay   bool          // send ack immediately for each incoming packet(testing purpose)
+		writeDelay   bool          // delay kcp.flush() for Write() for bulk transfer
+		dup          int           // duplicate udp packets(testing purpose)
+		fastAckDelay time.Duration // maximum delay before deferred fast ACK processing
 
 		// notifications
 		die          chan struct{} // notify current session has Closed
 		dieOnce      sync.Once
+		fastAckWake  atomic.Uint32 // coalesces deferred fast-ack scheduler wakeups
 		chReadEvent  chan struct{} // notify Read() can be called without blocking
 		chWriteEvent chan struct{} // notify Write() can be called without blocking
 
@@ -216,6 +220,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.ownConn = ownConn
 	sess.l = l
 	sess.block = block
+	sess.fastAckDelay = defaultFastAckDelay
 	sess.recvbuf = make([]byte, mtuLimit)
 	sess.initPlatform()
 
@@ -588,6 +593,17 @@ func (s *UDPSession) SetACKNoDelay(nodelay bool) {
 	s.mu.Unlock()
 }
 
+// SetFastAckDelay sets the maximum delay before deferred fast ACK processing.
+// The default is 20ms. A non-positive value restores the default.
+func (s *UDPSession) SetFastAckDelay(delay time.Duration) {
+	if delay <= 0 {
+		delay = defaultFastAckDelay
+	}
+	s.mu.Lock()
+	s.fastAckDelay = delay
+	s.mu.Unlock()
+}
+
 // (deprecated)
 //
 // SetDUP duplicates udp packets for kcp output.
@@ -822,10 +838,15 @@ func (s *UDPSession) postProcess() {
 
 // sess update to trigger protocol
 func (s *UDPSession) update() {
+	// A fast-ack wakeup and the regular interval timer share this callback.
+	// Clear the coalescing bit when the callback starts so an ACK arriving while
+	// this update is running can schedule the next bounded-latency wakeup.
+	s.fastAckWake.Store(0)
 	select {
 	case <-s.die:
 	default:
 		s.mu.Lock()
+		s.kcp.applyFastAcks()
 		interval := s.kcp.flush(IKCP_FLUSH_FULL)
 		waitsnd := s.kcp.WaitSnd()
 		if waitsnd < int(s.kcp.snd_wnd) {
@@ -835,6 +856,42 @@ func (s *UDPSession) update() {
 		// self-synchronized timed scheduling
 		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
 	}
+}
+
+// scheduleFastAckWake asks the shared scheduler to process deferred fast ACKs
+// within 20ms. The CAS coalesces bursts of ACKs into one scheduler task.
+func (s *UDPSession) scheduleFastAckWake() {
+	if s.fastAckWake.CompareAndSwap(0, 1) {
+		SystemTimedSched.Put(s.fastAckUpdate, time.Now().Add(s.fastAckDelay))
+	}
+}
+
+// fastAckUpdate applies pending fast ACKs without advancing the regular KCP
+// timer. It is a one-shot scheduler task, so it does not create a second
+// periodic update chain when a fast-ack wakeup races with the normal timer.
+func (s *UDPSession) fastAckUpdate() {
+	select {
+	case <-s.die:
+		return
+	default:
+	}
+
+	s.mu.Lock()
+	s.fastAckWake.Store(0)
+	if len(s.kcp.fastackEvents) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	if s.kcp.applyFastAcks() {
+		s.kcp.flush(IKCP_FLUSH_FULL)
+	}
+	if s.kcp.WaitSnd() < int(s.kcp.snd_wnd) {
+		s.notifyWriteEvent()
+	}
+	if len(s.kcp.fastackEvents) > 0 {
+		s.scheduleFastAckWake()
+	}
+	s.mu.Unlock()
 }
 
 // GetConv gets conversation id of a session
@@ -1164,6 +1221,9 @@ func (s *UDPSession) kcpInput(data []byte) {
 			// recycle the buffer
 			defaultBufferPool.Put(r)
 		}
+		if len(s.kcp.fastackEvents) > 0 {
+			s.scheduleFastAckWake()
+		}
 
 		// to notify the readers to receive the data if there's any
 		if n := s.kcp.PeekSize(); n > 0 {
@@ -1201,6 +1261,9 @@ func (s *UDPSession) kcpInput(data []byte) {
 
 		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
 			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+		}
+		if len(s.kcp.fastackEvents) > 0 {
+			s.scheduleFastAckWake()
 		}
 
 		if n := s.kcp.PeekSize(); n > 0 {
