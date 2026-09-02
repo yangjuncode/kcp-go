@@ -5,9 +5,29 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 )
 
 var BfUdpPingHead = []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xaa, 0xbb, 0xcc, 0xdd}
+
+// reconnectLogInterval 限制重连日志的输出频率，同一个地址每 5 秒最多一条
+const reconnectLogInterval = 5 * time.Second
+
+// reconnectLogMap 记录每个地址上次输出重连日志的时间
+var reconnectLogMap sync.Map // key: addr string, value: time.Time
+
+// shouldLogReconnect 检查是否应该输出重连日志（同一个地址每 5 秒最多一条）
+func shouldLogReconnect(addrStr string) bool {
+	now := time.Now()
+	if last, ok := reconnectLogMap.Load(addrStr); ok {
+		if last.(time.Time).Add(reconnectLogInterval).After(now) {
+			return false
+		}
+	}
+	reconnectLogMap.Store(addrStr, now)
+	return true
+}
 
 var PktUdpPing1 = []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xaa, 0xbb, 0xcc, 0xdd,
 	0x00, 0x00, 0x00, 0x00,

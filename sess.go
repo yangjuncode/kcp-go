@@ -1269,9 +1269,13 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 					exist = true
 					s = matchSession
 
-					fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
+					if shouldLogReconnect(addrStr) {
+						fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
+					}
 				} else {
-					fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
+					if shouldLogReconnect(addrStr) {
+						fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
+					}
 					return
 				}
 			} else {
