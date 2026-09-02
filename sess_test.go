@@ -1776,3 +1776,15 @@ func TestOOB_NonFEC(t *testing.T) {
 		t.Errorf("missing OOB echo for %d payload lengths (out of %d, threshold %d)", missing, len(counts), threshold)
 	}
 }
+
+func TestConversationIDReservedValues(t *testing.T) {
+	raddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, conv := range []uint32{0, 0xffffffff} {
+		if _, err := NewConn4(conv, raddr, nil, 0, 0, true, nil); err == nil {
+			t.Fatalf("NewConn4 accepted reserved conversation ID %#x", conv)
+		}
+	}
+}

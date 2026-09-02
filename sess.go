@@ -198,6 +198,10 @@ type (
 	}
 )
 
+func validConv(conv uint32) bool {
+	return conv != 0 && conv != 0xffffffff
+}
+
 // newUDPSession create a new udp session for client or server
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
@@ -1071,9 +1075,18 @@ func (s *UDPSession) packetInput(data []byte) {
 		data = data[crcSize:]
 	}
 
-	// basic check for minimum packet size
-	// NOTE: OOB allows sending small packets and even empty packets.
-	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	// Validate the framing before dispatch. Non-FEC OOB packets may be as
+	// short as conv+type (6 bytes); FEC OOB and regular packets need 12 bytes.
+	if len(data) < convSize+2 {
+		atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+		return
+	}
+	fecFlag := binary.LittleEndian.Uint16(data[4:])
+	if fecFlag == typeOOB {
+		if (s.fecEncoder != nil || s.fecDecoder != nil) && len(data) < fecHeaderSizePlus2+convSize {
+			return
+		}
+	} else if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
 		atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
 		return
 	}
@@ -1296,7 +1309,11 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		return
 	}
 	fecFlagForSize := binary.LittleEndian.Uint16(data[4:])
-	if fecFlagForSize != typeOOB && len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	if fecFlagForSize == typeOOB {
+		if l.dataShards > 0 && l.parityShards > 0 && len(data) < fecHeaderSizePlus2+convSize {
+			return
+		}
+	} else if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
 		return
 	}
 
@@ -1421,16 +1438,11 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		// OOB packets carry the conversation ID for routing to the correct session.
 		// Extract conv to allow pre-creating sessions when OOB arrives before handshake.
 		//
-		// Distinguish FEC vs non-FEC OOB by checking the seqid field:
-		//   FEC mode:    seqid = 0xffffffff (marker), conv is at data[fecHeaderSizePlus2:]
-		//   Non-FEC mode: data[0:4] is the actual conv ID directly
-		//
-		// Limitation: if non-FEC mode and conv happens to be exactly 0xffffffff,
-		// the packet will be misinterpreted as FEC OOB. This is a 1/4 billion
-		// probability and acceptable in practice.
+		// The listener configuration determines the packet layout. Do not infer
+		// the mode from conv/seqid: non-FEC allows any conversation ID, including
+		// 0xffffffff.
 		hasConv = true
-		if len(data) >= fecHeaderSizePlus2+convSize &&
-			binary.LittleEndian.Uint32(data) == 0xffffffff {
+		if l.dataShards > 0 && l.parityShards > 0 {
 			// FEC mode: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
 			conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
 		} else {
@@ -1471,6 +1483,9 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	}
 
 	// Now we have a valid conversation id here without a session object, create a new session.
+	if !validConv(conv) {
+		return
+	}
 	// do not let the new sessions overwhelm accept queue
 	if len(l.chAccepts) >= cap(l.chAccepts) {
 		return
@@ -1729,17 +1744,28 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 	}
 
 	var convid uint32
-	_ = binary.Read(rand.Reader, binary.LittleEndian, &convid)
+	for !validConv(convid) {
+		if err := binary.Read(rand.Reader, binary.LittleEndian, &convid); err != nil {
+			_ = conn.Close()
+			return nil, errors.WithStack(err)
+		}
+	}
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, true, udpaddr, block), nil
 }
 
 // NewConn4 establishes a session and talks KCP protocol over a packet connection.
 func NewConn4(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, ownConn bool, conn net.PacketConn) (*UDPSession, error) {
+	if !validConv(convid) {
+		return nil, errors.New("invalid conversation id")
+	}
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, ownConn, raddr, block), nil
 }
 
 // NewConn3 establishes a session and talks KCP protocol over a packet connection.
 func NewConn3(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
+	if !validConv(convid) {
+		return nil, errors.New("invalid conversation id")
+	}
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, false, raddr, block), nil
 }
 
