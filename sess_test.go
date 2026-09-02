@@ -1622,10 +1622,10 @@ func TestGetOOBMaxSize(t *testing.T) {
 	if n := sess.GetOOBMaxSize(); n != 1394 {
 		t.Errorf("expected 1394 in non-FEC mode, got %d", n)
 	}
-	// FEC mode: mtu - fecHeaderSizePlus2 - convSize
+	// FEC mode: mtu - convSize (s.kcp.mtu already excludes FEC header)
 	sess.fecEncoder = newFECEncoder(1, 1, 0)
-	if n := sess.GetOOBMaxSize(); n != 1388 {
-		t.Errorf("expected 1388 in FEC mode, got %d", n)
+	if n := sess.GetOOBMaxSize(); n != 1396 {
+		t.Errorf("expected 1396 in FEC mode, got %d", n)
 	}
 }
 

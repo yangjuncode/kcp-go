@@ -885,12 +885,13 @@ func (s *UDPSession) SetOOBHandler(callback OOBCallBackType) error {
 // OOB data in a single packet, based on the current MTU and protocol layout.
 //
 // OOB works with or without FEC. The max payload size differs:
-//   - FEC mode:    mtu - fecHeaderSizePlus2 - convSize (FEC header + conv overhead)
+//   - FEC mode:    mtu - convSize (s.kcp.mtu already excludes FEC header via headerSize)
 //   - Non-FEC mode: mtu - convSize - 2 (conv + typeOOB marker overhead)
 func (s *UDPSession) GetOOBMaxSize() int {
 	if s.fecEncoder != nil {
-		// FEC mode: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
-		return int(s.kcp.mtu) - fecHeaderSizePlus2 - convSize
+		// FEC mode: s.kcp.mtu already excludes headerSize (which includes fecHeaderSizePlus2).
+		// OOB payload space = s.kcp.mtu - convSize
+		return int(s.kcp.mtu) - convSize
 	}
 	// Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
 	return int(s.kcp.mtu) - convSize - 2
@@ -1094,6 +1095,15 @@ func (s *UDPSession) kcpInput(data []byte) {
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
 
+	// Minimum packet size check before reading data[4:].
+	// Non-FEC OOB minimum is convSize+2=6 bytes; all other packets need at least
+	// min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize)=12 bytes.
+	// We need at least convSize+2 bytes to safely read data[4:6].
+	if len(data) < convSize+2 {
+		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+		return
+	}
+
 	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
 
@@ -1278,18 +1288,15 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		data = data[crcSize:]
 	}
 
-	// basic check for minimum packet size
-	// NOTE: OOB allows sending small packets and even empty packets.
-	// Non-FEC OOB minimum is convSize+2=6 bytes, which is smaller than
-	// the normal minimum, so we check OOB type first to avoid dropping
-	// valid small OOB packets.
+	// basic check for minimum packet size before reading data[4:].
+	// We need at least convSize+2=6 bytes to safely read the type field at data[4:6].
+	// Non-FEC OOB minimum is convSize+2=6 bytes (conv + typeOOB marker).
+	// All other packets need at least min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize)=12 bytes.
+	if len(data) < convSize+2 {
+		return
+	}
 	fecFlagForSize := binary.LittleEndian.Uint16(data[4:])
-	if fecFlagForSize == typeOOB {
-		// OOB packet: minimum size is convSize+2 (non-FEC) or fecHeaderSizePlus2+convSize (FEC)
-		if len(data) < convSize+2 {
-			return
-		}
-	} else if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	if fecFlagForSize != typeOOB && len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
 		return
 	}
 
@@ -1412,9 +1419,15 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		// parity packet of FEC, conversation id inside
 	case typeOOB:
 		// OOB packets carry the conversation ID for routing to the correct session.
+		// Extract conv to allow pre-creating sessions when OOB arrives before handshake.
+		//
 		// Distinguish FEC vs non-FEC OOB by checking the seqid field:
 		//   FEC mode:    seqid = 0xffffffff (marker), conv is at data[fecHeaderSizePlus2:]
 		//   Non-FEC mode: data[0:4] is the actual conv ID directly
+		//
+		// Limitation: if non-FEC mode and conv happens to be exactly 0xffffffff,
+		// the packet will be misinterpreted as FEC OOB. This is a 1/4 billion
+		// probability and acceptable in practice.
 		hasConv = true
 		if len(data) >= fecHeaderSizePlus2+convSize &&
 			binary.LittleEndian.Uint32(data) == 0xffffffff {
