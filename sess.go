@@ -119,6 +119,9 @@ type sendRequest struct {
 // OOB callback function
 type OOBCallBackType func([]byte)
 
+// ListenerOOBCallBackType handles OOB data received before a session exists.
+type ListenerOOBCallBackType func([]byte, net.Addr, uint32)
+
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
@@ -1246,6 +1249,12 @@ type (
 		// 与 UDPSession.FnOutOfBandPing 相同用途，但 Listener 端可以
 		// 通过 pktPing.Listener 调用 Migrate2Session 等 Listener 级操作。
 		FnOutOfBandPing TOutOfBandPing
+
+		// callbackForOOB handles OOB packets received before a session exists.
+		// It is intentionally separate from UDPSession.callbackForOOB because
+		// there is no session object to route the packet to yet.
+		callbackForOOB atomic.Value
+		oobHandlerSet  atomic.Uint32
 	}
 )
 
@@ -1417,6 +1426,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 
 	var conv, sn uint32
 	hasConv := false
+	isOOB := false
 
 	// try to get conversation id from the packet
 	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
@@ -1435,8 +1445,10 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	case typeParity:
 		// parity packet of FEC, conversation id inside
 	case typeOOB:
+		isOOB = true
 		// OOB packets carry the conversation ID for routing to the correct session.
-		// Extract conv to allow pre-creating sessions when OOB arrives before handshake.
+		// Extract it before dispatching either to an existing session or the
+		// listener-level pre-connect handler.
 		//
 		// The listener configuration determines the packet layout. Do not infer
 		// the mode from conv/seqid: non-FEC allows any conversation ID, including
@@ -1448,6 +1460,22 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		} else {
 			// Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
 			conv = binary.LittleEndian.Uint32(data)
+		}
+		if !exist {
+			// An OOB packet may legitimately arrive before the KCP handshake.
+			// When a listener-level handler is configured, deliver it there
+			// instead of creating a session and consuming the AcceptKCP backlog.
+			// If no handler has ever been configured, preserve the historical
+			// behavior and allow this packet to establish a session.
+			if l.oobHandlerSet.Load() != 0 {
+				callback := l.callbackForOOB.Load()
+				if l.dataShards > 0 && l.parityShards > 0 {
+					callback.(ListenerOOBCallBackType)(data[fecHeaderSizePlus2+convSize:], addr, conv)
+				} else {
+					callback.(ListenerOOBCallBackType)(data[convSize+2:], addr, conv)
+				}
+			}
+			return
 		}
 	default:
 		// packet without FEC
@@ -1461,6 +1489,14 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 
 	// on an existing connection
 	if exist {
+		if isOOB {
+			// An OOB packet for an existing address must never be treated as a
+			// KCP reset merely because its conversation id differs.
+			if conv == s.kcp.conv {
+				s.kcpInput(data)
+			}
+			return
+		}
 		// If we have a valid conversation id or we cannot get conversation id from the packet,
 		// just feed the data into the existing session.
 		if !hasConv || conv == s.kcp.conv {
@@ -1498,6 +1534,93 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	l.sessions[addr.String()] = s
 	l.sessionLock.Unlock()
 	l.chAccepts <- s
+}
+
+// SetOOBHandler registers a callback for OOB packets received before a KCP
+// session has been created for the sender's address. Such packets are not
+// delivered to AcceptKCP and do not create a placeholder session.
+//
+// The callback is invoked synchronously from the listener input path and MUST
+// return quickly. Passing nil unregisters the callback; unknown-address OOB
+// packets are then dropped.
+func (l *Listener) SetOOBHandler(callback ListenerOOBCallBackType) error {
+	if callback == nil {
+		l.callbackForOOB.Store(ListenerOOBCallBackType(func([]byte, net.Addr, uint32) {}))
+		l.oobHandlerSet.Store(1)
+		return nil
+	}
+	l.callbackForOOB.Store(callback)
+	l.oobHandlerSet.Store(1)
+	return nil
+}
+
+// SendOOB sends an out-of-band (OOB) packet to addr using conv as its
+// conversation ID. It is intended for replying to listener-level OOB packets
+// received before a UDPSession has been created.
+//
+// The packet uses the same framing, FEC marker, and encryption pipeline as
+// UDPSession.SendOOB. OOB packets are unreliable and are not retransmitted.
+func (l *Listener) SendOOB(data []byte, addr net.Addr, conv uint32) error {
+	cryptoHeaderSize := 0
+	aeadOverhead := 0
+	if block, ok := l.block.(*aeadCrypt); ok {
+		cryptoHeaderSize = block.NonceSize()
+		aeadOverhead = block.Overhead()
+	} else if l.block != nil {
+		cryptoHeaderSize = cryptHeaderSize
+	}
+
+	fecEnabled := l.dataShards > 0 && l.parityShards > 0
+	protocolHeaderSize := 0
+	bodySize := convSize + 2 + len(data)
+	if fecEnabled {
+		protocolHeaderSize = fecHeaderSizePlus2
+		bodySize = convSize + len(data)
+	}
+	if cryptoHeaderSize+protocolHeaderSize+bodySize+aeadOverhead > mtuLimit {
+		return errors.New("OOB payload too large")
+	}
+
+	buf := defaultBufferPool.Get()[:cryptoHeaderSize+protocolHeaderSize+bodySize]
+	defer defaultBufferPool.Put(buf)
+
+	payloadOffset := cryptoHeaderSize
+	if fecEnabled {
+		binary.LittleEndian.PutUint32(buf[payloadOffset:], ^uint32(0))
+		binary.LittleEndian.PutUint16(buf[payloadOffset+4:], typeOOB)
+		binary.LittleEndian.PutUint16(buf[payloadOffset+6:], uint16(bodySize))
+		payloadOffset += fecHeaderSizePlus2
+	} else {
+		binary.LittleEndian.PutUint16(buf[cryptoHeaderSize+convSize:], typeOOB)
+	}
+	binary.LittleEndian.PutUint32(buf[payloadOffset:], conv)
+	if fecEnabled {
+		copy(buf[payloadOffset+convSize:], data)
+	} else {
+		copy(buf[payloadOffset+convSize+2:], data)
+	}
+
+	// Keep this in lockstep with UDPSession.postProcess's encryption stage.
+	switch block := l.block.(type) {
+	case nil:
+	case *aeadCrypt:
+		nonce := buf[:block.NonceSize()]
+		fillRand(nonce)
+		buf = block.Seal(buf[:block.NonceSize()], nonce, buf[block.NonceSize():], nil)
+	default:
+		fillRand(buf[:nonceSize])
+		checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
+		binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
+		block.Encrypt(buf, buf)
+	}
+
+	n, err := l.conn.WriteTo(buf, addr)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	atomic.AddUint64(&DefaultSnmp.OutPkts, 1)
+	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(n))
+	return nil
 }
 
 func (l *Listener) notifyReadError(err error) {

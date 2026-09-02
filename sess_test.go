@@ -28,10 +28,12 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	mrand "math/rand"
 	"net"
 	"net/http"
@@ -1611,6 +1613,222 @@ func TestSetOOBHandler_Basic(t *testing.T) {
 		} else {
 			t.Errorf("callbackForOOB type assertion failed: got %T", f)
 		}
+	}
+}
+
+func TestListenerOOBHandlerBeforeSession(t *testing.T) {
+	l := &Listener{
+		sessions:  make(map[string]*UDPSession),
+		chAccepts: make(chan *UDPSession, 1),
+	}
+
+	var got []byte
+	var gotAddr net.Addr
+	var gotConv uint32
+	if err := l.SetOOBHandler(func(payload []byte, addr net.Addr, conv uint32) {
+		got = append(got[:0], payload...)
+		gotAddr = addr
+		gotConv = conv
+	}); err != nil {
+		t.Fatalf("SetOOBHandler failed: %v", err)
+	}
+
+	packet := make([]byte, convSize+2+4)
+	binary.LittleEndian.PutUint32(packet, 123)
+	binary.LittleEndian.PutUint16(packet[convSize:], typeOOB)
+	copy(packet[convSize+2:], []byte("oob!"))
+	l.packetInput(packet, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10001})
+
+	if string(got) != "oob!" {
+		t.Fatalf("listener callback payload = %q, want %q", got, "oob!")
+	}
+	if gotAddr == nil || gotAddr.String() != "127.0.0.1:10001" {
+		t.Fatalf("listener callback address = %v, want 127.0.0.1:10001", gotAddr)
+	}
+	if gotConv != 123 {
+		t.Fatalf("listener callback conv = %d, want 123", gotConv)
+	}
+	if len(l.sessions) != 0 {
+		t.Fatalf("listener created %d sessions for pre-connect OOB", len(l.sessions))
+	}
+	select {
+	case <-l.chAccepts:
+		t.Fatal("pre-connect OOB unexpectedly entered AcceptKCP")
+	default:
+	}
+}
+
+func TestListenerOOBHandlerNilDropsPacket(t *testing.T) {
+	l := &Listener{
+		sessions:  make(map[string]*UDPSession),
+		chAccepts: make(chan *UDPSession, 1),
+	}
+	_ = l.SetOOBHandler(nil)
+	packet := make([]byte, convSize+2)
+	binary.LittleEndian.PutUint32(packet, 123)
+	binary.LittleEndian.PutUint16(packet[convSize:], typeOOB)
+	l.packetInput(packet, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10002})
+	if len(l.sessions) != 0 {
+		t.Fatalf("listener created a session for unhandled pre-connect OOB")
+	}
+}
+
+func TestListenerOOBHandlerBeforeSessionWithFEC(t *testing.T) {
+	l := &Listener{
+		dataShards:   1,
+		parityShards: 1,
+		sessions:     make(map[string]*UDPSession),
+		chAccepts:    make(chan *UDPSession, 1),
+	}
+
+	var got []byte
+	var gotConv uint32
+	if err := l.SetOOBHandler(func(payload []byte, _ net.Addr, conv uint32) {
+		got = append(got[:0], payload...)
+		gotConv = conv
+	}); err != nil {
+		t.Fatalf("SetOOBHandler failed: %v", err)
+	}
+
+	packet := make([]byte, fecHeaderSizePlus2+convSize+4)
+	binary.LittleEndian.PutUint32(packet, math.MaxUint32)
+	binary.LittleEndian.PutUint16(packet[4:], typeOOB)
+	binary.LittleEndian.PutUint16(packet[6:], uint16(convSize+4))
+	binary.LittleEndian.PutUint32(packet[fecHeaderSizePlus2:], 456)
+	copy(packet[fecHeaderSizePlus2+convSize:], []byte("fec!"))
+	l.packetInput(packet, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10003})
+
+	if string(got) != "fec!" || gotConv != 456 {
+		t.Fatalf("listener FEC callback got payload=%q conv=%d, want payload=%q conv=456", got, gotConv, "fec!")
+	}
+	if len(l.sessions) != 0 || len(l.chAccepts) != 0 {
+		t.Fatal("listener created a session for pre-connect FEC OOB")
+	}
+}
+
+func TestListenerOOBExistingSessionTakesPrecedence(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10004}
+	l := &Listener{
+		sessions:  make(map[string]*UDPSession),
+		chAccepts: make(chan *UDPSession, 1),
+	}
+	sess := &UDPSession{kcp: NewKCP(789, func([]byte, int) {})}
+	l.sessions[addr.String()] = sess
+
+	listenerCalled := false
+	_ = l.SetOOBHandler(func([]byte, net.Addr, uint32) { listenerCalled = true })
+	var sessionPayload []byte
+	_ = sess.SetOOBHandler(func(payload []byte) {
+		sessionPayload = append(sessionPayload[:0], payload...)
+	})
+
+	packet := make([]byte, convSize+2+4)
+	binary.LittleEndian.PutUint32(packet, sess.kcp.conv)
+	binary.LittleEndian.PutUint16(packet[convSize:], typeOOB)
+	copy(packet[convSize+2:], []byte("sess"))
+	l.packetInput(packet, addr)
+
+	if listenerCalled {
+		t.Fatal("listener handler received OOB for an existing session")
+	}
+	if string(sessionPayload) != "sess" {
+		t.Fatalf("session callback payload = %q, want %q", sessionPayload, "sess")
+	}
+
+	// A mismatched OOB conversation ID must be dropped, not treated as a
+	// sequence-zero KCP reset that closes the existing session.
+	binary.LittleEndian.PutUint32(packet, sess.kcp.conv+1)
+	l.packetInput(packet, addr)
+	if l.sessions[addr.String()] != sess {
+		t.Fatal("mismatched OOB replaced the existing session")
+	}
+}
+
+type capturePacketConn struct {
+	packet []byte
+	addr   net.Addr
+}
+
+func (c *capturePacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, io.EOF }
+func (c *capturePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.packet = append(c.packet[:0], p...)
+	c.addr = addr
+	return len(p), nil
+}
+func (c *capturePacketConn) Close() error                     { return nil }
+func (c *capturePacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *capturePacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *capturePacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *capturePacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestListenerSendOOB(t *testing.T) {
+	conn := new(capturePacketConn)
+	l := &Listener{conn: conn}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11001}
+	if err := l.SendOOB([]byte("reply"), addr, 321); err != nil {
+		t.Fatalf("SendOOB failed: %v", err)
+	}
+	if got, want := string(conn.packet[convSize+2:]), "reply"; got != want {
+		t.Fatalf("payload = %q, want %q", got, want)
+	}
+	if got := binary.LittleEndian.Uint32(conn.packet); got != 321 {
+		t.Fatalf("conv = %d, want 321", got)
+	}
+	if got := binary.LittleEndian.Uint16(conn.packet[convSize:]); got != typeOOB {
+		t.Fatalf("type = %#x, want %#x", got, typeOOB)
+	}
+	if conn.addr.String() != addr.String() {
+		t.Fatalf("destination = %v, want %v", conn.addr, addr)
+	}
+}
+
+func TestListenerSendOOBFEC(t *testing.T) {
+	conn := new(capturePacketConn)
+	l := &Listener{conn: conn, dataShards: 1, parityShards: 1}
+	if err := l.SendOOB([]byte("fec-reply"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11002}, 654); err != nil {
+		t.Fatalf("SendOOB failed: %v", err)
+	}
+	if got := binary.LittleEndian.Uint32(conn.packet); got != math.MaxUint32 {
+		t.Fatalf("FEC seqid = %d, want %d", got, uint32(math.MaxUint32))
+	}
+	if got := binary.LittleEndian.Uint16(conn.packet[4:]); got != typeOOB {
+		t.Fatalf("FEC type = %#x, want %#x", got, typeOOB)
+	}
+	if got, want := binary.LittleEndian.Uint16(conn.packet[6:]), uint16(convSize+len("fec-reply")); got != want {
+		t.Fatalf("FEC payload size = %d, want %d", got, want)
+	}
+	if got := binary.LittleEndian.Uint32(conn.packet[fecHeaderSizePlus2:]); got != 654 {
+		t.Fatalf("conv = %d, want 654", got)
+	}
+	if got, want := string(conn.packet[fecHeaderSizePlus2+convSize:]), "fec-reply"; got != want {
+		t.Fatalf("payload = %q, want %q", got, want)
+	}
+}
+
+func TestListenerOOBHandlerCanReply(t *testing.T) {
+	conn := new(capturePacketConn)
+	l := &Listener{conn: conn, sessions: make(map[string]*UDPSession), chAccepts: make(chan *UDPSession, 1)}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11003}
+	if err := l.SetOOBHandler(func(payload []byte, addr net.Addr, conv uint32) {
+		if string(payload) != "request" {
+			t.Errorf("callback payload = %q, want request", payload)
+		}
+		if err := l.SendOOB([]byte("response"), addr, conv); err != nil {
+			t.Errorf("callback SendOOB failed: %v", err)
+		}
+	}); err != nil {
+		t.Fatalf("SetOOBHandler failed: %v", err)
+	}
+	packet := make([]byte, convSize+2+len("request"))
+	binary.LittleEndian.PutUint32(packet, 777)
+	binary.LittleEndian.PutUint16(packet[convSize:], typeOOB)
+	copy(packet[convSize+2:], []byte("request"))
+	l.packetInput(packet, addr)
+	if got := binary.LittleEndian.Uint32(conn.packet); got != 777 {
+		t.Fatalf("response conv = %d, want 777", got)
+	}
+	if got, want := string(conn.packet[convSize+2:]), "response"; got != want {
+		t.Fatalf("response payload = %q, want %q", got, want)
 	}
 }
 
