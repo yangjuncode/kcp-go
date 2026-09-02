@@ -976,7 +976,9 @@ func (s *UDPSession) notifyWriteError(err error) {
 // Pipeline: Network -> [Decrypt] -> [CRC32] -> kcpInput
 func (s *UDPSession) packetInput(data []byte) {
 	if len(data) == 16 {
-		go ClientOutOfBandPing(data, s)
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+		go ClientOutOfBandPing(dataCopy, s)
 		return
 	}
 	switch block := s.block.(type) {
