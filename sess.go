@@ -1263,8 +1263,6 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 			l.sessionLock.RUnlock()
 		} else {
 			// 收到来自未知地址的包，可能是新连接或重连。
-			// 异步发送 cmd=8 ping 包，通知客户端触发重连流程。
-			go BfSendUdpPing8(l, addr)
 
 			// 重连恢复逻辑仅对非 FEC 包生效。
 			//
@@ -1330,7 +1328,8 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 						fmt.Println(time.Now().Format(time.StampMilli), "kcp fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
 					} else {
 						// matchCount == 0（找不到匹配）或 >1（多个匹配，无法确定），
-						// 丢弃此包。这是原始设计行为，用于 FRP 场景下避免误建连。
+						// 无法 fast recover，发 ping8 通知客户端触发重连流程，然后丢弃此包。
+						go BfSendUdpPing8(l, addr)
 						if shouldLogReconnect(addrStr) {
 							fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
 						}
