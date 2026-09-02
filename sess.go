@@ -46,6 +46,7 @@
 package kcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -975,7 +976,7 @@ func (s *UDPSession) notifyWriteError(err error) {
 //
 // Pipeline: Network -> [Decrypt] -> [CRC32] -> kcpInput
 func (s *UDPSession) packetInput(data []byte) {
-	if len(data) == 16 {
+	if len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
 		dataCopy := make([]byte, len(data))
 		copy(dataCopy, data)
 		go ClientOutOfBandPing(dataCopy, s)
@@ -1169,7 +1170,7 @@ type (
 // and dispatches to existing sessions or creates new ones.
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	//fmt.Println(time.Now().Format(time.StampMilli), "packetInput", addr.String(), " len:", len(data), " hex:", hex.EncodeToString(data))
-	if len(data) == 16 {
+	if len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
 		//copy data
 		dataCopy := make([]byte, len(data))
 		copy(dataCopy, data)
