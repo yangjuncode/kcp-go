@@ -169,6 +169,11 @@ type (
 		// rate limiter (bytes per second)
 		rateLimiter atomic.Value
 
+		// FnOutOfBandPing 是用户注册的 out-of-band ping 回调。
+		// 当收到 16 字节 ping 包（匹配 BfUdpPingHead）时调用。
+		// nil 表示不处理 ping 包（默认值）。
+		// 与上游内置的 callbackForOOB 不同：这是自定义的 ping/重连机制，
+		// 不依赖 FEC，使用固定 16 字节包格式。
 		FnOutOfBandPing TOutOfBandPing
 
 		mu sync.Mutex
@@ -363,6 +368,10 @@ RESET_TIMER:
 		}
 	}
 }
+// WriteOutOfBand 直接通过底层 UDP 连接发送原始数据，绕过 KCP/FEC/加密。
+//
+// 用于发送 out-of-band ping 包等不需要 KCP 可靠传输的原始 UDP 数据。
+// 调用者需要自行构造完整的包格式（如 BfUdpPingHead 头部）。
 func (s *UDPSession) WriteOutOfBand(b []byte) (n int, err error) {
 	return s.conn.WriteTo(b, s.remote)
 }
@@ -976,6 +985,18 @@ func (s *UDPSession) notifyWriteError(err error) {
 //
 // Pipeline: Network -> [Decrypt] -> [CRC32] -> kcpInput
 func (s *UDPSession) packetInput(data []byte) {
+	// out-of-band ping 包拦截：16 字节且前 8 字节匹配 BfUdpPingHead。
+	//
+	// 为什么需要同时检查长度和头部：
+	// - 只检查长度（len==16）会误拦截其他 16 字节的合法小包（如无加密模式下的
+	//   空payload OOB 包），导致丢包
+	// - 加上 bytes.HasPrefix 验证后，只有真正的 ping 包才会被拦截处理
+	//
+	// 为什么需要 copy data：
+	// data 指向 readLoop 的复用 buffer（readloop.go 中的 buf），packetInput
+	// 返回后 readLoop 会立即读下一个包覆盖 buffer。如果直接把 data 传给
+	// 异步 goroutine，goroutine 可能读到被覆盖的数据（数据竞争）。
+	// 所以必须先 copy 到独立 buffer 再传给 goroutine。
 	if len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
 		dataCopy := make([]byte, len(data))
 		copy(dataCopy, data)
@@ -1161,6 +1182,9 @@ type (
 
 		rd atomic.Value // read deadline for Accept()
 
+		// FnOutOfBandPing 是 Listener 端的 out-of-band ping 回调。
+		// 与 UDPSession.FnOutOfBandPing 相同用途，但 Listener 端可以
+		// 通过 pktPing.Listener 调用 Migrate2Session 等 Listener 级操作。
 		FnOutOfBandPing TOutOfBandPing
 	}
 )
@@ -1169,13 +1193,13 @@ type (
 // It decrypts the packet, demultiplexes by remote address,
 // and dispatches to existing sessions or creates new ones.
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
-	//fmt.Println(time.Now().Format(time.StampMilli), "packetInput", addr.String(), " len:", len(data), " hex:", hex.EncodeToString(data))
+	// out-of-band ping 包拦截：与 UDPSession.packetInput 中的逻辑相同。
+	// 16 字节 + 前缀匹配才拦截，避免误丢其他 16 字节合法包。
+	// copy data 原因同上：readLoop buffer 复用，异步 goroutine 需要独立 buffer。
 	if len(data) == 16 && bytes.HasPrefix(data, BfUdpPingHead) {
-		//copy data
 		dataCopy := make([]byte, len(data))
 		copy(dataCopy, data)
 		go ListenerOutOfBandPing(dataCopy, addr, l)
-		//len = 16 is not a valid kcp packet
 		return
 	}
 	switch block := l.block.(type) {
@@ -1225,21 +1249,37 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	l.sessionLock.RLock()
 	s, exist := l.sessions[addrStr]
 	if !exist {
-		//new connection or reconnection
+		// 收到来自未知地址的包，可能是新连接或重连。
+		// 异步发送 cmd=8 ping 包，通知客户端触发重连流程。
 		go BfSendUdpPing8(l, addr)
 
-		// 重连恢复逻辑仅对非 FEC 包生效（FEC/OOB 包的 conv/una 字段偏移不同）
+		// 重连恢复逻辑仅对非 FEC 包生效。
+		//
+		// 为什么需要检查 fecFlagEarly：
+		// 重连逻辑读取 data[0:](conv) 和 data[16:](una)，这两个偏移只对
+		// 非 FEC 的裸 KCP 包正确。FEC 包（typeData/typeParity）的 conv 在
+		// fecHeaderSizePlus2 偏移处，OOB 包（typeOOB）的 conv 也在不同位置。
+		// 如果对 FEC 包应用重连逻辑，会读到垃圾值，误判为重连并丢包。
+		// rebase 时发现此问题导致测试超时，故加此检查。
+		//
+		// fecFlag 正确性：非 FEC KCP 包的 data[4:5] 是 cmd(81-84)，
+		// data[5:6] 是 frg(0-255)，组合成 uint16 不可能等于 0xf1/0xf2/0xf3。
 		fecFlagEarly := binary.LittleEndian.Uint16(data[4:])
 		if fecFlagEarly != typeData && fecFlagEarly != typeParity && fecFlagEarly != typeOOB {
+			// 非 FEC 包，读取 KCP 头中的 una 字段（offset 16，4 字节）
 			var una uint32
 			if len(data) >= IKCP_OVERHEAD {
 				una = binary.LittleEndian.Uint32(data[16:])
 			}
 			if una != 0 {
-				//reconnection
+				// una != 0 表示客户端已有已发送未确认的数据，说明不是全新连接，
+				// 而是重连（NAT 端口切换等场景）。
+				// 读取 conv ID 用于在现有 session 中查找匹配。
 				conv := binary.LittleEndian.Uint32(data)
 				lastCommaNew := strings.LastIndex(addrStr, ":")
 
+				// 遍历所有 session，查找 conv 匹配且 IP 相同的 session。
+				// 只匹配 IP 不匹配端口，因为重连时端口会变但 IP 不变。
 				matchCount := 0
 				var matchSession *UDPSession
 				for ii := range l.sessions {
@@ -1249,16 +1289,19 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 						lastCommaOld := strings.LastIndex(oldAddrStr, ":")
 
 						if oldAddrStr[:lastCommaOld] != addrStr[:lastCommaNew] {
-							//ip not equal
+							// IP 不相等，不是同一个客户端的重连
 							continue
 						}
 						matchSession = ss
 						matchCount++
 					}
 				}
+				// 遍历完成，释放读锁
 				l.sessionLock.RUnlock()
 
 				if matchCount == 1 {
+					// 精确匹配到一个 session，执行 fast recover：
+					// 把 session 从旧地址迁移到新地址。
 					oldAddr := matchSession.remote
 					l.sessionLock.Lock()
 
@@ -1267,6 +1310,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 					matchSession.remote = addr
 					l.sessionLock.Unlock()
 
+					// 设置 exist=true 让后续代码把包交给迁移后的 session 处理
 					exist = true
 					s = matchSession
 
@@ -1274,20 +1318,23 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 						fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
 					}
 				} else {
+					// matchCount == 0（找不到匹配）或 >1（多个匹配，无法确定），
+					// 丢弃此包。这是原始设计行为，用于 FRP 场景下避免误建连。
 					if shouldLogReconnect(addrStr) {
 						fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
 					}
 					return
 				}
 			} else {
-				//new connection, do nothing
+				// una == 0，全新连接，不做特殊处理，释放读锁走正常建连流程
 				l.sessionLock.RUnlock()
 			}
 		} else {
-			//FEC or OOB packet, skip reconnection logic
+			// FEC 或 OOB 包，跳过重连逻辑，释放读锁走正常建连流程
 			l.sessionLock.RUnlock()
 		}
 	} else {
+		// 已有 session，释放读锁，继续正常处理
 		l.sessionLock.RUnlock()
 	}
 
@@ -1498,6 +1545,15 @@ func (l *Listener) Control(f func(conn net.PacketConn) error) error {
 }
 
 // closeSession notify the listener that a session has closed
+//
+// 为什么需要传入 s 参数并做 ss == s 检查：
+// 重连恢复（fast recover）会把 session 从旧地址迁移到新地址。迁移后，
+// 旧 session 对象仍然存在，其 Close() 会被调用（如超时关闭）。
+// 如果不加 ss == s 检查，旧 session 的 Close() 会通过旧地址查到
+// 新 session（因为新 session 可能复用了旧地址），误删新 session。
+//
+// 加了检查后，只有当 map 中的 session 就是调用者自身时才删除，
+// 避免误删迁移后的新 session。
 func (l *Listener) closeSession(remote net.Addr, s *UDPSession) (ret bool) {
 	l.sessionLock.Lock()
 	defer l.sessionLock.Unlock()
