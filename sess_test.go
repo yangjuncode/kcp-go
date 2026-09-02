@@ -1567,10 +1567,10 @@ func TestOOB_OneSideHandler(t *testing.T) {
 func TestSetOOBHandler_Basic(t *testing.T) {
 	sess := new(UDPSession)
 	sess.kcp = NewKCP(1, func(buf []byte, size int) {})
-	// Should return error if FEC is not enabled
+	// OOB now works without FEC, should not error
 	err := sess.SetOOBHandler(func([]byte) {})
-	if err == nil {
-		t.Error("expected error when FEC is not enabled")
+	if err != nil {
+		t.Errorf("register callback without FEC should not error, got %v", err)
 	}
 
 	// Should allow register/unregister callback after FEC enabled
@@ -1617,39 +1617,162 @@ func TestSetOOBHandler_Basic(t *testing.T) {
 func TestGetOOBMaxSize(t *testing.T) {
 	sess := new(UDPSession)
 	sess.kcp = NewKCP(1, func(buf []byte, size int) {})
-	// Should return 0 if FEC is not enabled
-	if n := sess.GetOOBMaxSize(); n != 0 {
-		t.Errorf("expected 0 when FEC not enabled, got %d", n)
-	}
-	// Should return mtu-4 after FEC enabled
-	sess.fecEncoder = newFECEncoder(1, 1, 0)
+	// Non-FEC mode: mtu - convSize - 2
 	sess.kcp.mtu = 1400
-	if n := sess.GetOOBMaxSize(); n != 1396 {
-		t.Errorf("expected 1396, got %d", n)
+	if n := sess.GetOOBMaxSize(); n != 1394 {
+		t.Errorf("expected 1394 in non-FEC mode, got %d", n)
+	}
+	// FEC mode: mtu - fecHeaderSizePlus2 - convSize
+	sess.fecEncoder = newFECEncoder(1, 1, 0)
+	if n := sess.GetOOBMaxSize(); n != 1388 {
+		t.Errorf("expected 1388 in FEC mode, got %d", n)
 	}
 }
 
 func TestSendOOB_Errors(t *testing.T) {
 	sess := new(UDPSession)
 	sess.kcp = NewKCP(1, func(buf []byte, size int) {})
-	// Should error if FEC is not enabled
+	// Non-FEC mode: should work without FEC
+	// Need to set up die channel and chPostProcessing for SendOOB
+	sess.die = make(chan struct{})
+	sess.chPostProcessing = make(chan sendRequest, 64)
+	sess.headerSize = 0
+	sess.kcp.mtu = 1400
 	err := sess.SendOOB([]byte("abc"))
-	if err == nil || err.Error() != "OOB requires FEC to be enabled" {
-		t.Errorf("expected 'OOB requires FEC to be enabled', got %v", err)
+	if err != nil {
+		t.Errorf("expected no error in non-FEC mode, got %v", err)
 	}
-	// NOTE: SendOOB no longer requires callbackForOOB to be non-nil on sender side.
-	// It should not return error if callback is not set after FEC is enabled.
+	// FEC mode
 	sess.fecEncoder = newFECEncoder(1, 1, 0)
+	sess.headerSize = fecHeaderSizePlus2
 	err = sess.SendOOB([]byte("abc"))
 	if err != nil {
-		t.Errorf("expected no error when callback not set, got %v", err)
+		t.Errorf("expected no error in FEC mode, got %v", err)
 	}
-	// Should error if payload is too large
+	// Should error if payload is too large (non-FEC mode)
+	sess.fecEncoder = nil
+	sess.headerSize = 0
 	sess.kcp.mtu = 8
 	cb := func([]byte) {}
 	sess.SetOOBHandler(cb)
 	err = sess.SendOOB([]byte("123456789"))
 	if err == nil || err.Error() != "OOB payload too large" {
 		t.Errorf("expected 'OOB payload too large', got %v", err)
+	}
+}
+
+// TestOOB_NonFEC verifies that OOB works without FEC enabled.
+// Both server and client use dataShards=0, parityShards=0 (no FEC).
+// OOB packets use | conv (4B) | typeOOB (2B) | payload | format.
+func TestOOB_NonFEC(t *testing.T) {
+	port := nextPort()
+	block1, _ := NewAESGCMCrypt(pass)
+
+	// Listen without FEC (0, 0)
+	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block1, 0, 0)
+	if err != nil {
+		panic(err)
+	}
+	defer l.Close()
+
+	go func() {
+		l.SetReadBuffer(4 * 1024 * 1024)
+		l.SetWriteBuffer(4 * 1024 * 1024)
+		for {
+			s, err := l.Accept()
+			if err != nil {
+				return
+			}
+			sess := s.(*UDPSession)
+			sess.SetReadBuffer(4 * 1024 * 1024)
+			sess.SetWriteBuffer(4 * 1024 * 1024)
+			// Register OOB callback, echo back received OOB data
+			sess.SetOOBHandler(func(buf []byte) {
+				if err := sess.SendOOB(buf); err != nil {
+					t.Errorf("server failed to echo OOB payload: %v", err)
+				}
+			})
+			go handleEcho(sess)
+		}
+	}()
+
+	block2, _ := NewAESGCMCrypt(pass)
+	// Dial without FEC (0, 0)
+	cli, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block2, 0, 0)
+	if err != nil {
+		panic(err)
+	}
+	defer cli.Close()
+	cli.SetWriteDelay(false)
+
+	size := cli.GetOOBMaxSize()
+	if size <= 0 {
+		t.Fatalf("unexpectedly small max OOB size in non-FEC mode: %d", size)
+	}
+	t.Log("Max OOB size (non-FEC):", size)
+
+	sizePlus1 := size + 1
+	counts := make([]atomic.Int32, sizePlus1)
+
+	// Client registers OOB callback to validate echoed OOB data
+	cli.SetOOBHandler(func(buf []byte) {
+		for i, b := range buf {
+			if b != byte(i) {
+				t.Fatalf(
+					"OOB echo payload mismatch at offset %d: expected %d, got %d",
+					i, byte(i), b,
+				)
+				break
+			}
+		}
+		counts[len(buf)].Add(1)
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		// Normal data channel stress test
+		randomEchoTest(t, cli, 1*1024*1024)
+	}()
+
+	go func() {
+		defer wg.Done()
+		// Send OOB data of varying lengths
+		buf := make([]byte, size)
+		for i := range len(buf) {
+			buf[i] = byte(i)
+		}
+		for i := range 100 * 1024 {
+			if err := cli.SendOOB(buf[:i%sizePlus1]); err != nil {
+				t.Errorf("client failed to send OOB payload: %v", err)
+			}
+			if i%128 == 0 {
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	// Give time for remaining OOB echoes to arrive
+	time.Sleep(500 * time.Millisecond)
+
+	// Check that all lengths of OOB data are correctly echoed back.
+	// OOB is unreliable by design, so a small number of missing lengths is acceptable.
+	missing := 0
+	for i := range counts {
+		if counts[i].Load() == 0 {
+			missing++
+		}
+	}
+	// Allow up to 1% missing (OOB is best-effort, some packets may be dropped)
+	threshold := len(counts) / 100
+	if threshold < 10 {
+		threshold = 10
+	}
+	if missing > threshold {
+		t.Errorf("missing OOB echo for %d payload lengths (out of %d, threshold %d)", missing, len(counts), threshold)
 	}
 }

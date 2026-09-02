@@ -867,12 +867,10 @@ func (s *UDPSession) GetSRTTVar() int32 {
 //
 // Passing a nil callback unregisters the current OOB callback.
 //
-// OOB support requires FEC to be enabled, as the OOB packet format
-// reuses the FEC header layout for demultiplexing.
+// OOB works with or without FEC:
+//   - FEC mode:    | FEC header (8B) | conv (4B) | OOB payload |
+//   - Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
 func (s *UDPSession) SetOOBHandler(callback OOBCallBackType) error {
-	if s.fecEncoder == nil {
-		return errors.New("OOB requires FEC to be enabled")
-	}
 	if callback == nil {
 		s.callbackForOOB.Store(OOBCallBackType(func([]byte) {}))
 		return nil
@@ -886,13 +884,16 @@ func (s *UDPSession) SetOOBHandler(callback OOBCallBackType) error {
 // The returned value is the maximum number of bytes that can be carried as
 // OOB data in a single packet, based on the current MTU and protocol layout.
 //
-// If FEC is not enabled, OOB is unsupported and this function returns 0.
+// OOB works with or without FEC. The max payload size differs:
+//   - FEC mode:    mtu - fecHeaderSizePlus2 - convSize (FEC header + conv overhead)
+//   - Non-FEC mode: mtu - convSize - 2 (conv + typeOOB marker overhead)
 func (s *UDPSession) GetOOBMaxSize() int {
-	if s.fecEncoder == nil {
-		return 0
+	if s.fecEncoder != nil {
+		// FEC mode: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
+		return int(s.kcp.mtu) - fecHeaderSizePlus2 - convSize
 	}
-	// Packet layout: | conv (4B) | OOB payload |
-	return int(s.kcp.mtu) - convSize
+	// Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
+	return int(s.kcp.mtu) - convSize - 2
 }
 
 // SendOOB sends an out-of-band (OOB) data packet.
@@ -902,48 +903,74 @@ func (s *UDPSession) GetOOBMaxSize() int {
 //   - Are unordered: delivery order is not guaranteed.
 //   - Are unacknowledged: no ACKs are generated.
 //   - Bypass the KCP reliable data path.
-//   - Reuse the FEC header layout for demultiplexing, but are NOT protected by FEC.
+//
+// OOB works with or without FEC:
+//   - FEC mode:    | FEC header (8B) | conv (4B) | OOB payload |
+//     Reuses FEC header layout for demultiplexing, but is NOT protected by FEC.
+//   - Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
+//     Uses typeOOB marker (0xf3) at data[4:6] for demultiplexing.
+//     0xf3 does not collide with KCP cmd(81-84)+frg(0-255) values.
 //
 // The OOB payload MUST fit into a single packet.
 // If the payload is too large, an error is returned.
 //
 // If the internal send queue is full, the OOB packet is dropped silently.
 func (s *UDPSession) SendOOB(data []byte) error {
-	if s.fecEncoder == nil {
-		return errors.New("OOB requires FEC to be enabled")
-	}
-
 	// lock the session during OOB packet construction
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Packet layout: | conv (4B) | OOB payload |
-	size := convSize + len(data)
+	if s.fecEncoder != nil {
+		// FEC mode: packet layout after encryption header is
+		// | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
+		// s.headerSize already includes fecHeaderSizePlus2 + encryption header.
+		size := convSize + len(data)
+		if size > int(s.kcp.mtu) {
+			return errors.New("OOB payload too large")
+		}
+
+		// Allocate buffer with reserved header space.
+		// s.headerSize includes the space needed by the FEC encoder + encryption.
+		buf := defaultBufferPool.Get()[:size+s.headerSize]
+		// Encode conversation ID.
+		binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
+		// Copy OOB payload immediately after the conversation ID.
+		copy(buf[s.headerSize+convSize:], data)
+
+		select {
+		case s.chPostProcessing <- sendRequest{buf, true}:
+			return nil
+		case <-s.die:
+			defaultBufferPool.Put(buf)
+			return errors.WithStack(io.ErrClosedPipe)
+		default:
+			defaultBufferPool.Put(buf)
+			return nil
+		}
+	}
+
+	// Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
+	size := convSize + 2 + len(data)
 	if size > int(s.kcp.mtu) {
 		return errors.New("OOB payload too large")
 	}
 
-	// Allocate buffer with reserved header space.
-	// s.headerSize includes the space needed by the FEC encoder.
+	// Allocate buffer with reserved encryption header space.
 	buf := defaultBufferPool.Get()[:size+s.headerSize]
 	// Encode conversation ID.
 	binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
+	// Encode typeOOB marker (0xf3) at offset 4.
+	binary.LittleEndian.PutUint16(buf[s.headerSize+convSize:], typeOOB)
+	// Copy OOB payload after typeOOB marker.
+	copy(buf[s.headerSize+convSize+2:], data)
 
-	// Copy OOB payload immediately after the conversation ID.
-	copy(buf[s.headerSize+convSize:], data)
-
-	// Enqueue the packet for post-processing.
-	// Performs OOB framing, encryption, and transmission, bypassing FEC and KCP.
 	select {
 	case s.chPostProcessing <- sendRequest{buf, true}:
 		return nil
 	case <-s.die:
-		// Session is closing.
 		defaultBufferPool.Put(buf)
 		return errors.WithStack(io.ErrClosedPipe)
 	default:
-		// Drop silently to avoid blocking the sender.
-		// OOB delivery is best-effort by design.
 		defaultBufferPool.Put(buf)
 		return nil
 	}
@@ -1136,8 +1163,14 @@ func (s *UDPSession) kcpInput(data []byte) {
 		// If an OOB callback is registered, invoke it synchronously.
 		// The callback is responsible for ensuring non-blocking behavior.
 		if callback := s.callbackForOOB.Load(); callback != nil {
-			// Data layout: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
-			callback.(OOBCallBackType)(data[fecHeaderSizePlus2+convSize:])
+			// Payload offset depends on whether FEC is enabled:
+			//   FEC mode:    | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
+			//   Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
+			if s.fecEncoder != nil || s.fecDecoder != nil {
+				callback.(OOBCallBackType)(data[fecHeaderSizePlus2+convSize:])
+			} else {
+				callback.(OOBCallBackType)(data[convSize+2:])
+			}
 		}
 	default: // packet without FEC
 		s.mu.Lock()
@@ -1247,7 +1280,16 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 
 	// basic check for minimum packet size
 	// NOTE: OOB allows sending small packets and even empty packets.
-	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
+	// Non-FEC OOB minimum is convSize+2=6 bytes, which is smaller than
+	// the normal minimum, so we check OOB type first to avoid dropping
+	// valid small OOB packets.
+	fecFlagForSize := binary.LittleEndian.Uint16(data[4:])
+	if fecFlagForSize == typeOOB {
+		// OOB packet: minimum size is convSize+2 (non-FEC) or fecHeaderSizePlus2+convSize (FEC)
+		if len(data) < convSize+2 {
+			return
+		}
+	} else if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
 		return
 	}
 
@@ -1369,10 +1411,19 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	case typeParity:
 		// parity packet of FEC, conversation id inside
 	case typeOOB:
-		// OOB packets always carry the conversation ID immediately after the FEC header.
+		// OOB packets carry the conversation ID for routing to the correct session.
+		// Distinguish FEC vs non-FEC OOB by checking the seqid field:
+		//   FEC mode:    seqid = 0xffffffff (marker), conv is at data[fecHeaderSizePlus2:]
+		//   Non-FEC mode: data[0:4] is the actual conv ID directly
 		hasConv = true
-		// Data layout: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
-		conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+		if len(data) >= fecHeaderSizePlus2+convSize &&
+			binary.LittleEndian.Uint32(data) == 0xffffffff {
+			// FEC mode: | FEC header (fecHeaderSizePlus2) | conv (4B) | OOB payload |
+			conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+		} else {
+			// Non-FEC mode: | conv (4B) | typeOOB (2B) | OOB payload |
+			conv = binary.LittleEndian.Uint32(data)
+		}
 	default:
 		// packet without FEC
 		if len(data) < IKCP_OVERHEAD { // basic check for minimum kcp packet size
