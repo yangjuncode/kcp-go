@@ -368,6 +368,7 @@ RESET_TIMER:
 		}
 	}
 }
+
 // WriteOutOfBand 直接通过底层 UDP 连接发送原始数据，绕过 KCP/FEC/加密。
 //
 // 用于发送 out-of-band ping 包等不需要 KCP 可靠传输的原始 UDP 数据。
@@ -1278,74 +1279,72 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 			// data[5:6] 是 frg(0-255)，组合成 uint16 不可能等于 0xf1/0xf2/0xf3。
 			fecFlagEarly := binary.LittleEndian.Uint16(data[4:])
 			if fecFlagEarly != typeData && fecFlagEarly != typeParity && fecFlagEarly != typeOOB {
-			// 非 FEC 包，读取 KCP 头中的 una 字段（offset 16，4 字节）
-			var una uint32
-			if len(data) >= IKCP_OVERHEAD {
-				una = binary.LittleEndian.Uint32(data[16:])
-			}
-			if una != 0 {
-				// una != 0 表示客户端已有已发送未确认的数据，说明不是全新连接，
-				// 而是重连（NAT 端口切换等场景）。
-				// 读取 conv ID 用于在现有 session 中查找匹配。
-				conv := binary.LittleEndian.Uint32(data)
-				lastCommaNew := strings.LastIndex(addrStr, ":")
-
-				// 遍历所有 session，查找 conv 匹配且 IP 相同的 session。
-				// 只匹配 IP 不匹配端口，因为重连时端口会变但 IP 不变。
-				matchCount := 0
-				var matchSession *UDPSession
-				for ii := range l.sessions {
-					ss := l.sessions[ii]
-					if ss.kcp.conv == conv {
-						oldAddrStr := ss.RemoteAddr().String()
-						lastCommaOld := strings.LastIndex(oldAddrStr, ":")
-
-						if oldAddrStr[:lastCommaOld] != addrStr[:lastCommaNew] {
-							// IP 不相等，不是同一个客户端的重连
-							continue
-						}
-						matchSession = ss
-						matchCount++
-					}
+				// 非 FEC 包，读取 KCP 头中的 una 字段（offset 16，4 字节）
+				var una uint32
+				if len(data) >= IKCP_OVERHEAD {
+					una = binary.LittleEndian.Uint32(data[16:])
 				}
-				// 遍历完成，释放读锁
-				l.sessionLock.RUnlock()
+				if una != 0 {
+					// una != 0 表示客户端已有已发送未确认的数据，说明不是全新连接，
+					// 而是重连（NAT 端口切换等场景）。
+					// 读取 conv ID 用于在现有 session 中查找匹配。
+					conv := binary.LittleEndian.Uint32(data)
+					lastCommaNew := strings.LastIndex(addrStr, ":")
 
-				if matchCount == 1 {
-					// 精确匹配到一个 session，执行 fast recover：
-					// 把 session 从旧地址迁移到新地址。
-					oldAddr := matchSession.remote
-					l.sessionLock.Lock()
+					// 遍历所有 session，查找 conv 匹配且 IP 相同的 session。
+					// 只匹配 IP 不匹配端口，因为重连时端口会变但 IP 不变。
+					matchCount := 0
+					var matchSession *UDPSession
+					for ii := range l.sessions {
+						ss := l.sessions[ii]
+						if ss.kcp.conv == conv {
+							oldAddrStr := ss.RemoteAddr().String()
+							lastCommaOld := strings.LastIndex(oldAddrStr, ":")
 
-					delete(l.sessions, matchSession.RemoteAddr().String())
-					l.sessions[addrStr] = matchSession
-					matchSession.remote = addr
-					l.sessionLock.Unlock()
+							if oldAddrStr[:lastCommaOld] != addrStr[:lastCommaNew] {
+								// IP 不相等，不是同一个客户端的重连
+								continue
+							}
+							matchSession = ss
+							matchCount++
+						}
+					}
+					// 遍历完成，释放读锁
+					l.sessionLock.RUnlock()
 
-					// 设置 exist=true 让后续代码把包交给迁移后的 session 处理
-					exist = true
-					s = matchSession
+					if matchCount == 1 {
+						// 精确匹配到一个 session，执行 fast recover：
+						// 把 session 从旧地址迁移到新地址。
+						oldAddr := matchSession.remote
+						l.sessionLock.Lock()
 
-					if shouldLogReconnect(addrStr) {
-						fmt.Println(time.Now().Format(time.StampMilli), "fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
+						delete(l.sessions, matchSession.RemoteAddr().String())
+						l.sessions[addrStr] = matchSession
+						matchSession.remote = addr
+						l.sessionLock.Unlock()
+
+						// 设置 exist=true 让后续代码把包交给迁移后的 session 处理
+						exist = true
+						s = matchSession
+
+						fmt.Println(time.Now().Format(time.StampMilli), "kcp fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
+					} else {
+						// matchCount == 0（找不到匹配）或 >1（多个匹配，无法确定），
+						// 丢弃此包。这是原始设计行为，用于 FRP 场景下避免误建连。
+						if shouldLogReconnect(addrStr) {
+							fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
+						}
+						return
 					}
 				} else {
-					// matchCount == 0（找不到匹配）或 >1（多个匹配，无法确定），
-					// 丢弃此包。这是原始设计行为，用于 FRP 场景下避免误建连。
-					if shouldLogReconnect(addrStr) {
-						fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored for udp ping 8", addr.String())
-					}
-					return
+					// una == 0，全新连接，不做特殊处理，释放读锁走正常建连流程
+					l.sessionLock.RUnlock()
 				}
 			} else {
-				// una == 0，全新连接，不做特殊处理，释放读锁走正常建连流程
+				// FEC 或 OOB 包，跳过重连逻辑，释放读锁走正常建连流程
 				l.sessionLock.RUnlock()
 			}
-		} else {
-			// FEC 或 OOB 包，跳过重连逻辑，释放读锁走正常建连流程
-			l.sessionLock.RUnlock()
-		}
-	} // 关闭 FnOutOfBandPing != nil 的 else 块
+		} // 关闭 FnOutOfBandPing != nil 的 else 块
 	} else {
 		// 已有 session，释放读锁，继续正常处理
 		l.sessionLock.RUnlock()
