@@ -1767,14 +1767,21 @@ func TestListenerOOBExistingSessionTakesPrecedence(t *testing.T) {
 }
 
 type capturePacketConn struct {
-	packet []byte
-	addr   net.Addr
+	packet      []byte
+	addr        net.Addr
+	writeNotify chan struct{}
 }
 
 func (c *capturePacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, io.EOF }
 func (c *capturePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	c.packet = append(c.packet[:0], p...)
 	c.addr = addr
+	if c.writeNotify != nil {
+		select {
+		case c.writeNotify <- struct{}{}:
+		default:
+		}
+	}
 	return len(p), nil
 }
 func (c *capturePacketConn) Close() error                     { return nil }
@@ -1801,6 +1808,239 @@ func TestListenerSendOOB(t *testing.T) {
 	}
 	if conn.addr.String() != addr.String() {
 		t.Fatalf("destination = %v, want %v", conn.addr, addr)
+	}
+}
+
+func TestSessionOOBAndSessionControlFraming(t *testing.T) {
+	sess := &UDPSession{
+		kcp:              NewKCP(321, func([]byte, int) {}),
+		die:              make(chan struct{}),
+		chPostProcessing: make(chan sendRequest, 2),
+	}
+	sess.kcp.mtu = 1400
+
+	if err := sess.SendOOB([]byte("oob")); err != nil {
+		t.Fatalf("SendOOB failed: %v", err)
+	}
+	oob := <-sess.chPostProcessing
+	defer defaultBufferPool.Put(oob.buffer)
+	if got := binary.LittleEndian.Uint16(oob.buffer[convSize:]); got != typeOOB {
+		t.Fatalf("OOB type = %#x, want %#x", got, typeOOB)
+	}
+	if oob.specialType != 0 {
+		t.Fatalf("OOB special type = %#x, want 0", oob.specialType)
+	}
+
+	var uuid SessionUUID
+	uuid[0] = 1
+	sess.SetSessionUUID(uuid)
+	sess.SetSessionGeneration(7)
+	if err := sess.SendSessionReport(); err != nil {
+		t.Fatalf("SendSessionReport failed: %v", err)
+	}
+	control := <-sess.chPostProcessing
+	defer defaultBufferPool.Put(control.buffer)
+	if got := binary.LittleEndian.Uint16(control.buffer[convSize:]); got != typeSessionControl {
+		t.Fatalf("session control type = %#x, want %#x", got, typeSessionControl)
+	}
+	if control.specialType != typeSessionControl {
+		t.Fatalf("session control special type = %#x, want %#x", control.specialType, typeSessionControl)
+	}
+	if got := control.buffer[convSize+2]; got != sessionControlReport {
+		t.Fatalf("session control command = %d, want %d", got, sessionControlReport)
+	}
+}
+
+func TestSessionMismatchAutomaticallyReportsConfiguredUUID(t *testing.T) {
+	newSession := func(uuid SessionUUID) (*UDPSession, chan sendRequest) {
+		sess := &UDPSession{
+			kcp:              NewKCP(321, func([]byte, int) {}),
+			die:              make(chan struct{}),
+			chPostProcessing: make(chan sendRequest, 1),
+		}
+		sess.sessionUUID = uuid
+		return sess, sess.chPostProcessing
+	}
+
+	var uuid SessionUUID
+	uuid[0] = 1
+	sess, queue := newSession(uuid)
+	sess.sessionGeneration.Store(7)
+	called := false
+	_ = sess.SetSessionMismatchHandler(func(*SessionMismatchEvent) { called = true })
+	packet := make([]byte, convSize+2+1)
+	binary.LittleEndian.PutUint32(packet, sess.kcp.conv)
+	binary.LittleEndian.PutUint16(packet[convSize:], typeSessionControl)
+	packet[convSize+2] = sessionControlMismatch
+	sess.packetInput(packet)
+	if !called {
+		t.Fatal("mismatch callback was not called")
+	}
+	report := <-queue
+	defer defaultBufferPool.Put(report.buffer)
+	if report.specialType != typeSessionControl || binary.LittleEndian.Uint16(report.buffer[convSize:]) != typeSessionControl || report.buffer[convSize+2] != sessionControlReport {
+		t.Fatalf("automatic report framing = type %#x command %d", binary.LittleEndian.Uint16(report.buffer[convSize:]), report.buffer[convSize+2])
+	}
+	if got := report.buffer[convSize+3 : convSize+19]; !bytes.Equal(got, uuid[:]) {
+		t.Fatalf("automatic report UUID = %x, want %x", got, uuid)
+	}
+	if got := binary.LittleEndian.Uint32(report.buffer[convSize+19 : convSize+23]); got != 7 {
+		t.Fatalf("automatic report generation = %d, want 7", got)
+	}
+
+	zero := SessionUUID{}
+	sess, queue = newSession(zero)
+	_ = sess.SetSessionMismatchHandler(func(*SessionMismatchEvent) {})
+	sess.packetInput(packet)
+	select {
+	case report := <-queue:
+		defaultBufferPool.Put(report.buffer)
+		t.Fatal("zero UUID unexpectedly triggered automatic report")
+	default:
+	}
+}
+
+func TestSessionOOBAndSessionControlFECWireType(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11004}
+	conn := &capturePacketConn{writeNotify: make(chan struct{}, 2)}
+	sess := &UDPSession{
+		kcp:              NewKCP(321, func([]byte, int) {}),
+		conn:             conn,
+		remote:           addr,
+		die:              make(chan struct{}),
+		chPostProcessing: make(chan sendRequest, 2),
+		headerSize:       fecHeaderSizePlus2,
+		fecEncoder:       newFECEncoder(1, 1, 0),
+	}
+	defer close(sess.die)
+	go sess.postProcess()
+
+	if err := sess.SendOOB([]byte("oob")); err != nil {
+		t.Fatalf("SendOOB failed: %v", err)
+	}
+	select {
+	case <-conn.writeNotify:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for FEC OOB packet")
+	}
+	if got := binary.LittleEndian.Uint16(conn.packet[4:]); got != typeOOB {
+		t.Fatalf("FEC OOB wire type = %#x, want %#x", got, typeOOB)
+	}
+
+	if err := sess.SendSessionReport(); err != nil {
+		t.Fatalf("SendSessionReport failed: %v", err)
+	}
+	select {
+	case <-conn.writeNotify:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for FEC session control packet")
+	}
+	if got := binary.LittleEndian.Uint16(conn.packet[4:]); got != typeSessionControl {
+		t.Fatalf("FEC session control wire type = %#x, want %#x", got, typeSessionControl)
+	}
+}
+
+func TestListenerSendSessionControl(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11004}
+
+	conn := new(capturePacketConn)
+	l := &Listener{conn: conn}
+	if err := l.SendSessionControl([]byte{sessionControlMismatch}, addr, 321); err != nil {
+		t.Fatalf("SendSessionControl failed: %v", err)
+	}
+	if got := binary.LittleEndian.Uint16(conn.packet[convSize:]); got != typeSessionControl {
+		t.Fatalf("non-FEC type = %#x, want %#x", got, typeSessionControl)
+	}
+
+	fecConn := new(capturePacketConn)
+	fecListener := &Listener{conn: fecConn, dataShards: 1, parityShards: 1}
+	if err := fecListener.SendSessionControl([]byte{sessionControlMismatch}, addr, 654); err != nil {
+		t.Fatalf("FEC SendSessionControl failed: %v", err)
+	}
+	if got := binary.LittleEndian.Uint16(fecConn.packet[4:]); got != typeSessionControl {
+		t.Fatalf("FEC type = %#x, want %#x", got, typeSessionControl)
+	}
+}
+
+func TestSessionMismatchControlAndRecover(t *testing.T) {
+	addr1 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1001}
+	addr2 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 1002}
+	var uuid SessionUUID
+	for i := range uuid {
+		uuid[i] = byte(i + 1)
+	}
+	sess := &UDPSession{remote: addr1, kcp: NewKCP(100, func([]byte, int) {})}
+	sess.sessionUUID = uuid
+	sess.sessionGeneration.Store(7)
+	var mismatch bool
+	_ = sess.SetSessionMismatchHandler(func(ev *SessionMismatchEvent) { mismatch = ev.Conv == 100 })
+	packet := make([]byte, convSize+2+1)
+	binary.LittleEndian.PutUint32(packet, 100)
+	binary.LittleEndian.PutUint16(packet[convSize:], typeSessionControl)
+	packet[convSize+2] = sessionControlMismatch
+	sess.packetInput(packet)
+	if !mismatch {
+		t.Fatal("session mismatch handler was not called")
+	}
+
+	conn := new(capturePacketConn)
+	l := &Listener{conn: conn, sessions: map[string]*UDPSession{addr1.String(): sess}, chAccepts: make(chan *UDPSession, 1)}
+	report := make([]byte, convSize+2+1+16+4)
+	binary.LittleEndian.PutUint32(report, 100)
+	binary.LittleEndian.PutUint16(report[convSize:], typeSessionControl)
+	report[convSize+2] = sessionControlReport
+	copy(report[convSize+3:], uuid[:])
+	binary.LittleEndian.PutUint32(report[convSize+3+16:], 7)
+	l.packetInput(report, addr2)
+	if sess.remote.String() != addr2.String() {
+		t.Fatalf("session was not migrated: %v", sess.remote)
+	}
+	if conn.addr.String() != addr2.String() {
+		t.Fatalf("recover ack destination = %v", conn.addr)
+	}
+	if got := binary.LittleEndian.Uint16(conn.packet[convSize:]); got != typeSessionControl {
+		t.Fatalf("recover ack type = %#x, want %#x", got, typeSessionControl)
+	}
+	ackOffset := convSize + 2
+	if got := conn.packet[ackOffset]; got != sessionControlRecover {
+		t.Fatalf("recover command = %d", got)
+	}
+	if !bytes.Equal(conn.packet[ackOffset+1:ackOffset+17], uuid[:]) {
+		t.Fatal("recover ack UUID mismatch")
+	}
+	if got := binary.LittleEndian.Uint32(conn.packet[ackOffset+17:]); got != 7 {
+		t.Fatalf("recover generation = %d", got)
+	}
+}
+
+func TestListenerSessionReportRejectsZeroUUIDAndAddressCollision(t *testing.T) {
+	addr1 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1001}
+	addr2 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 1002}
+	addr3 := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 3), Port: 1003}
+	var uuid SessionUUID
+	uuid[0] = 1
+	target := &UDPSession{remote: addr1, kcp: NewKCP(100, func([]byte, int) {})}
+	target.sessionUUID = uuid
+	occupied := &UDPSession{remote: addr2, kcp: NewKCP(200, func([]byte, int) {})}
+	conn := new(capturePacketConn)
+	l := &Listener{conn: conn, sessions: map[string]*UDPSession{
+		addr1.String(): target,
+		addr2.String(): occupied,
+	}}
+
+	report := make([]byte, convSize+2+1+16+4)
+	binary.LittleEndian.PutUint32(report, 100)
+	binary.LittleEndian.PutUint16(report[convSize:], typeSessionControl)
+	report[convSize+2] = sessionControlReport
+	l.packetInput(report, addr3)
+	if target.remote.String() != addr1.String() || conn.packet != nil {
+		t.Fatal("zero UUID report must not recover a session")
+	}
+
+	copy(report[convSize+3:], uuid[:])
+	l.packetInput(report, addr2)
+	if target.remote.String() != addr1.String() || l.sessions[addr2.String()] != occupied || conn.packet != nil {
+		t.Fatal("report must not replace an existing session at the new address")
 	}
 }
 
@@ -2017,14 +2257,19 @@ func TestOOB_NonFEC(t *testing.T) {
 	}
 }
 
-func TestConversationIDReservedValues(t *testing.T) {
+func TestConversationIDBoundaryValues(t *testing.T) {
 	raddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, conv := range []uint32{0, 0xffffffff} {
-		if _, err := NewConn4(conv, raddr, nil, 0, 0, true, nil); err == nil {
-			t.Fatalf("NewConn4 accepted reserved conversation ID %#x", conv)
+		if sess, err := NewConn4(conv, raddr, nil, 0, 0, true, new(capturePacketConn)); err != nil {
+			t.Fatalf("NewConn4 rejected conversation ID %#x: %v", conv, err)
+		} else {
+			if got := sess.kcp.conv; got != conv {
+				t.Fatalf("session conversation ID = %#x, want %#x", got, conv)
+			}
+			_ = sess.Close()
 		}
 	}
 }

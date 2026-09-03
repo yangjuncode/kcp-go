@@ -152,6 +152,12 @@ FEC SEQID:
 SIZE:
   The size of KCP frame plus 2
 
+The KCP `conv` field is an unsigned 32-bit conversation identifier. Every
+value in `[0, 0xffffffff]` is valid, including `0` and `0xffffffff`; both peers
+must use the same value for a session. The `0xffffffff` in the FEC `SEQID`
+description is a separate FEC marker and does not reserve that value for
+`conv`.
+
 KCP Header
 +------------------------------+
 |           conv (u32)         |

@@ -50,11 +50,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -114,8 +112,9 @@ func (timeoutError) Temporary() bool { return true }
 
 // sendRequest defines a write request before encoding and transmission
 type sendRequest struct {
-	buffer []byte
-	oob    bool
+	buffer      []byte
+	oob         bool
+	specialType uint16
 }
 
 // OOB callback function
@@ -176,12 +175,17 @@ type (
 		// rate limiter (bytes per second)
 		rateLimiter atomic.Value
 
+		sessionUUID       SessionUUID
+		sessionGeneration atomic.Uint32
+
 		// FnOutOfBandPing 是用户注册的 out-of-band ping 回调。
 		// 当收到 16 字节 ping 包（匹配 BfUdpPingHead）时调用。
 		// nil 表示不处理 ping 包（默认值）。
 		// 与上游内置的 callbackForOOB 不同：这是自定义的 ping/重连机制，
 		// 不依赖 FEC，使用固定 16 字节包格式。
-		FnOutOfBandPing TOutOfBandPing
+		FnOutOfBandPing            TOutOfBandPing
+		callbackForSessionMismatch atomic.Value
+		callbackForSessionRecover  atomic.Value
 
 		mu sync.Mutex
 
@@ -204,10 +208,6 @@ type (
 		SetDSCP(int) error
 	}
 )
-
-func validConv(conv uint32) bool {
-	return conv != 0 && conv != 0xffffffff
-}
 
 // newUDPSession create a new udp session for client or server
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
@@ -256,7 +256,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 			// delivery to post processing (non-blocking to avoid deadlock under lock)
 			select {
-			case sess.chPostProcessing <- sendRequest{bts, false}:
+			case sess.chPostProcessing <- sendRequest{buffer: bts}:
 			case <-sess.die:
 				return
 			default:
@@ -739,6 +739,9 @@ func (s *UDPSession) postProcess() {
 					ecc = s.fecEncoder.encode(buf, maxFECEncodeLatency)
 				} else {
 					s.fecEncoder.encodeOOB(buf)
+					if req.specialType != 0 {
+						binary.LittleEndian.PutUint16(buf[s.fecEncoder.headerOffset+4:], req.specialType)
+					}
 				}
 			}
 
@@ -943,6 +946,63 @@ func (s *UDPSession) SetOOBHandler(callback OOBCallBackType) error {
 	return nil
 }
 
+func (s *UDPSession) SetSessionUUID(uuid SessionUUID) { s.sessionUUID = uuid }
+func (s *UDPSession) SessionUUID() SessionUUID        { return s.sessionUUID }
+func (s *UDPSession) SetSessionGeneration(g uint32)   { s.sessionGeneration.Store(g) }
+func (s *UDPSession) SessionGeneration() uint32       { return s.sessionGeneration.Load() }
+
+func (s *UDPSession) SetSessionMismatchHandler(callback SessionMismatchCallback) error {
+	if callback == nil {
+		s.callbackForSessionMismatch.Store(SessionMismatchCallback(func(*SessionMismatchEvent) {}))
+		return nil
+	}
+	s.callbackForSessionMismatch.Store(callback)
+	return nil
+}
+
+func (s *UDPSession) SetSessionRecoverHandler(callback SessionRecoverCallback) error {
+	if callback == nil {
+		s.callbackForSessionRecover.Store(SessionRecoverCallback(func(SessionUUID, uint32) {}))
+		return nil
+	}
+	s.callbackForSessionRecover.Store(callback)
+	return nil
+}
+
+// SendSessionReport reports this session's UUID and generation to the peer.
+func (s *UDPSession) SendSessionReport() error {
+	p := make([]byte, 1+16+4)
+	p[0] = sessionControlReport
+	copy(p[1:], s.sessionUUID[:])
+	binary.LittleEndian.PutUint32(p[17:], s.sessionGeneration.Load())
+	return s.sendSessionControl(p)
+}
+
+func (s *UDPSession) hasSessionUUID() bool {
+	for _, b := range s.sessionUUID {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *UDPSession) handleSessionMismatch(addr net.Addr) {
+	// A configured UUID proves the client can identify the logical session.
+	// Report it before notifying the application so migration can proceed without
+	// requiring a callback solely to relay the report.
+	if s.hasSessionUUID() {
+		_ = s.SendSessionReport()
+	}
+	if cb := s.callbackForSessionMismatch.Load(); cb != nil {
+		cb.(SessionMismatchCallback)(&SessionMismatchEvent{
+			Addr:       addr,
+			Conv:       s.kcp.conv,
+			Generation: s.sessionGeneration.Load(),
+		})
+	}
+}
+
 // GetOOBMaxSize returns the maximum payload size for an OOB packet.
 //
 // The returned value is the maximum number of bytes that can be carried as
@@ -1003,7 +1063,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 		copy(buf[s.headerSize+convSize:], data)
 
 		select {
-		case s.chPostProcessing <- sendRequest{buf, true}:
+		case s.chPostProcessing <- sendRequest{buffer: buf, oob: true}:
 			return nil
 		case <-s.die:
 			defaultBufferPool.Put(buf)
@@ -1030,7 +1090,49 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	copy(buf[s.headerSize+convSize+2:], data)
 
 	select {
-	case s.chPostProcessing <- sendRequest{buf, true}:
+	case s.chPostProcessing <- sendRequest{buffer: buf, oob: true}:
+		return nil
+	case <-s.die:
+		defaultBufferPool.Put(buf)
+		return errors.WithStack(io.ErrClosedPipe)
+	default:
+		defaultBufferPool.Put(buf)
+		return nil
+	}
+}
+
+func (s *UDPSession) sendSessionControl(payload []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fecEncoder != nil {
+		size := convSize + len(payload)
+		if size > int(s.kcp.mtu) {
+			return errors.New("session control payload too large")
+		}
+		buf := defaultBufferPool.Get()[:size+s.headerSize]
+		binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
+		copy(buf[s.headerSize+convSize:], payload)
+		select {
+		case s.chPostProcessing <- sendRequest{buffer: buf, oob: true, specialType: typeSessionControl}:
+			return nil
+		case <-s.die:
+			defaultBufferPool.Put(buf)
+			return errors.WithStack(io.ErrClosedPipe)
+		default:
+			defaultBufferPool.Put(buf)
+			return nil
+		}
+	}
+	size := convSize + 2 + len(payload)
+	if size > int(s.kcp.mtu) {
+		return errors.New("session control payload too large")
+	}
+	buf := defaultBufferPool.Get()[:size+s.headerSize]
+	binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
+	binary.LittleEndian.PutUint16(buf[s.headerSize+convSize:], typeSessionControl)
+	copy(buf[s.headerSize+convSize+2:], payload)
+	select {
+	case s.chPostProcessing <- sendRequest{buffer: buf, oob: true, specialType: typeSessionControl}:
 		return nil
 	case <-s.die:
 		defaultBufferPool.Put(buf)
@@ -1142,6 +1244,19 @@ func (s *UDPSession) packetInput(data []byte) {
 		return
 	}
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
+	if fecFlag == typeSessionControl {
+		off := convSize + 2
+		if s.fecEncoder != nil || s.fecDecoder != nil {
+			off = fecHeaderSizePlus2 + convSize
+		}
+		if len(data) <= off {
+			return
+		}
+		if data[off] == sessionControlMismatch {
+			s.handleSessionMismatch(nil)
+		}
+		return
+	}
 	if fecFlag == typeOOB {
 		if (s.fecEncoder != nil || s.fecDecoder != nil) && len(data) < fecHeaderSizePlus2+convSize {
 			return
@@ -1258,6 +1373,30 @@ func (s *UDPSession) kcpInput(data []byte) {
 				callback.(OOBCallBackType)(data[convSize+2:])
 			}
 		}
+	case typeSessionControl:
+		off := convSize + 2
+		if s.fecEncoder != nil || s.fecDecoder != nil {
+			off = fecHeaderSizePlus2 + convSize
+		}
+		if len(data) <= off {
+			return
+		}
+		switch data[off] {
+		case sessionControlMismatch:
+			s.handleSessionMismatch(s.remote)
+		case sessionControlRecover:
+			if len(data) >= off+21 {
+				var uuid SessionUUID
+				copy(uuid[:], data[off+1:off+17])
+				generation := binary.LittleEndian.Uint32(data[off+17:])
+				if uuid == s.sessionUUID && generation == s.sessionGeneration.Load() {
+					if cb := s.callbackForSessionRecover.Load(); cb != nil {
+						cb.(SessionRecoverCallback)(uuid, generation)
+					}
+				}
+			}
+		}
+		return
 	default: // packet without FEC
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -1312,6 +1451,11 @@ type (
 		// 与 UDPSession.FnOutOfBandPing 相同用途，但 Listener 端可以
 		// 通过 pktPing.Listener 调用 Migrate2Session 等 Listener 级操作。
 		FnOutOfBandPing TOutOfBandPing
+
+		// callbackForSessionMismatch is notified when a reconnect packet cannot
+		// be matched to an existing session. It does not require OOB ping.
+		callbackForSessionMismatch atomic.Value
+		sessionMismatchHandlerSet  atomic.Uint32
 
 		// callbackForOOB handles OOB packets received before a session exists.
 		// It is intentionally separate from UDPSession.callbackForOOB because
@@ -1381,7 +1525,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		return
 	}
 	fecFlagForSize := binary.LittleEndian.Uint16(data[4:])
-	if fecFlagForSize == typeOOB {
+	if fecFlagForSize == typeOOB || fecFlagForSize == typeSessionControl {
 		if l.dataShards > 0 && l.parityShards > 0 && len(data) < fecHeaderSizePlus2+convSize {
 			return
 		}
@@ -1394,99 +1538,63 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	l.sessionLock.RLock()
 	s, exist := l.sessions[addrStr]
 	if !exist {
-		// 优化：如果用户未设置 FnOutOfBandPing 回调，跳过所有 out-of-band ping
-		// 相关处理（ping8 发送 + 重连逻辑），直接走正常建连流程。
-		// 这样在未启用 ping 功能时，代码行为与上游原版完全一致，无额外开销。
-		if l.FnOutOfBandPing == nil {
+		// Reconnect recovery is opt-in. The mismatch handler enables it even
+		// when the out-of-band ping mechanism is disabled.
+		if l.FnOutOfBandPing == nil && l.sessionMismatchHandlerSet.Load() == 0 {
 			l.sessionLock.RUnlock()
-		} else {
-			// 收到来自未知地址的包，可能是新连接或重连。
+			goto dispatch
+		}
+		// 收到来自未知地址的包，可能是新连接或重连。
 
-			// 重连恢复逻辑仅对非 FEC 包生效。
-			//
-			// 为什么需要检查 fecFlagEarly：
-			// 重连逻辑读取 data[0:](conv) 和 data[16:](una)，这两个偏移只对
-			// 非 FEC 的裸 KCP 包正确。FEC 包（typeData/typeParity）的 conv 在
-			// fecHeaderSizePlus2 偏移处，OOB 包（typeOOB）的 conv 也在不同位置。
-			// 如果对 FEC 包应用重连逻辑，会读到垃圾值，误判为重连并丢包。
-			// rebase 时发现此问题导致测试超时，故加此检查。
-			//
-			// fecFlag 正确性：非 FEC KCP 包的 data[4:5] 是 cmd(81-84)，
-			// data[5:6] 是 frg(0-255)，组合成 uint16 不可能等于 0xf1/0xf2/0xf3。
-			fecFlagEarly := binary.LittleEndian.Uint16(data[4:])
-			if fecFlagEarly != typeData && fecFlagEarly != typeParity && fecFlagEarly != typeOOB {
-				// 非 FEC 包，读取 KCP 头中的 una 字段（offset 16，4 字节）
-				var una uint32
-				if len(data) >= IKCP_OVERHEAD {
-					una = binary.LittleEndian.Uint32(data[16:])
-				}
-				if una != 0 {
-					// una != 0 表示客户端已有已发送未确认的数据，说明不是全新连接，
-					// 而是重连（NAT 端口切换等场景）。
-					// 读取 conv ID 用于在现有 session 中查找匹配。
-					conv := binary.LittleEndian.Uint32(data)
-					lastCommaNew := strings.LastIndex(addrStr, ":")
+		// 重连恢复逻辑仅对非 FEC 包生效。
+		//
+		// 为什么需要检查 fecFlagEarly：
+		// 重连逻辑读取 data[0:](conv) 和 data[16:](una)，这两个偏移只对
+		// 非 FEC 的裸 KCP 包正确。FEC 包（typeData/typeParity）的 conv 在
+		// fecHeaderSizePlus2 偏移处，OOB 包（typeOOB）的 conv 也在不同位置。
+		// 如果对 FEC 包应用重连逻辑，会读到垃圾值，误判为重连并丢包。
+		// rebase 时发现此问题导致测试超时，故加此检查。
+		//
+		// fecFlag 正确性：非 FEC KCP 包的 data[4:5] 是 cmd(81-84)，
+		// data[5:6] 是 frg(0-255)，组合成 uint16 不可能等于 0xf1/0xf2/0xf3。
+		fecFlagEarly := binary.LittleEndian.Uint16(data[4:])
+		if fecFlagEarly != typeData && fecFlagEarly != typeParity && fecFlagEarly != typeOOB && fecFlagEarly != typeSessionControl {
+			// 非 FEC 包，读取 KCP 头中的 una 字段（offset 16，4 字节）
+			var una uint32
+			if len(data) >= IKCP_OVERHEAD {
+				una = binary.LittleEndian.Uint32(data[16:])
+			}
+			if una != 0 {
+				// una != 0 表示客户端已有已发送未确认的数据，说明不是全新连接，
+				// 而是重连（NAT 端口切换等场景）。
+				// 读取 conv ID 以通知客户端发生 session mismatch。
+				// 不按 IP 或 conv 迁移：移动端可能更换网络，conv 也可能重复；
+				// 只有后续 UUID report 才能授权地址迁移。
+				conv := binary.LittleEndian.Uint32(data)
+				// 释放读锁后发送控制通知，避免在网络 I/O 中持锁。
+				l.sessionLock.RUnlock()
 
-					// 遍历所有 session，查找 conv 匹配且 IP 相同的 session。
-					// 只匹配 IP 不匹配端口，因为重连时端口会变但 IP 不变。
-					matchCount := 0
-					var matchSession *UDPSession
-					for ii := range l.sessions {
-						ss := l.sessions[ii]
-						if ss.kcp.conv == conv {
-							oldAddrStr := ss.RemoteAddr().String()
-							lastCommaOld := strings.LastIndex(oldAddrStr, ":")
-
-							if oldAddrStr[:lastCommaOld] != addrStr[:lastCommaNew] {
-								// IP 不相等，不是同一个客户端的重连
-								continue
-							}
-							matchSession = ss
-							matchCount++
-						}
+				l.sendSessionMismatch(addr, conv)
+				if l.sessionMismatchHandlerSet.Load() != 0 {
+					if callback, ok := l.callbackForSessionMismatch.Load().(ListenerSessionMismatchCallBackType); ok {
+						callback(addr, conv)
 					}
-					// 遍历完成，释放读锁
-					l.sessionLock.RUnlock()
-
-					if matchCount == 1 {
-						// 精确匹配到一个 session，执行 fast recover：
-						// 把 session 从旧地址迁移到新地址。
-						oldAddr := matchSession.remote
-						l.sessionLock.Lock()
-
-						delete(l.sessions, matchSession.RemoteAddr().String())
-						l.sessions[addrStr] = matchSession
-						matchSession.remote = addr
-						l.sessionLock.Unlock()
-
-						// 设置 exist=true 让后续代码把包交给迁移后的 session 处理
-						exist = true
-						s = matchSession
-
-						fmt.Println(time.Now().Format(time.StampMilli), "kcp fast recover reconnect from ", oldAddr.String(), " to ", addr.String())
-					} else {
-						// matchCount == 0（找不到匹配）或 >1（多个匹配，无法确定），
-						// 无法 fast recover，发 ping8 通知客户端触发重连流程，然后丢弃此包。
-						go BfSendUdpPing8(l, addr)
-						if shouldLogReconnect(addrStr) {
-							fmt.Println(time.Now().Format(time.StampMilli), "packetInput ignored send outofbandping 8", addr.String())
-						}
-						return
-					}
-				} else {
-					// una == 0，全新连接，不做特殊处理，释放读锁走正常建连流程
-					l.sessionLock.RUnlock()
 				}
+				return
 			} else {
-				// FEC 或 OOB 包，跳过重连逻辑，释放读锁走正常建连流程
+				// una == 0，全新连接，不做特殊处理，释放读锁走正常建连流程
 				l.sessionLock.RUnlock()
 			}
-		} // 关闭 FnOutOfBandPing != nil 的 else 块
+		} else {
+			// FEC 或 OOB 包，跳过重连逻辑，释放读锁走正常建连流程
+			l.sessionLock.RUnlock()
+		}
 	} else {
 		// 已有 session，释放读锁，继续正常处理
 		l.sessionLock.RUnlock()
 	}
 
+dispatch:
 	var conv, sn uint32
 	hasConv := false
 	isOOB := false
@@ -1496,6 +1604,51 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
 
 	switch fecFlag {
+	case typeSessionControl:
+		off := convSize + 2
+		if l.dataShards > 0 && l.parityShards > 0 {
+			conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+			off = fecHeaderSizePlus2 + convSize
+		} else {
+			conv = binary.LittleEndian.Uint32(data)
+		}
+		if len(data) < off+21 || data[off] != sessionControlReport {
+			return
+		}
+		var uuid SessionUUID
+		copy(uuid[:], data[off+1:off+17])
+		if uuid == (SessionUUID{}) {
+			return
+		}
+		generation := binary.LittleEndian.Uint32(data[off+17:])
+		var target *UDPSession
+		l.sessionLock.RLock()
+		for _, candidate := range l.sessions {
+			if candidate.sessionUUID == uuid && candidate.kcp.conv == conv {
+				target = candidate
+				break
+			}
+		}
+		l.sessionLock.RUnlock()
+		if target == nil {
+			return
+		}
+		l.sessionLock.Lock()
+		if existing, ok := l.sessions[addr.String()]; ok && existing != target {
+			l.sessionLock.Unlock()
+			return
+		}
+		delete(l.sessions, target.remote.String())
+		target.remote = addr
+		l.sessions[addr.String()] = target
+		l.sessionLock.Unlock()
+		target.sessionGeneration.Store(generation)
+		ack := make([]byte, 21)
+		ack[0] = sessionControlRecover
+		copy(ack[1:], uuid[:])
+		binary.LittleEndian.PutUint32(ack[17:], generation)
+		_ = l.SendSessionControl(ack, addr, conv)
+		return
 	case typeData:
 		// data packet of FEC, conversation id inside
 		if len(data) < fecHeaderSizePlus2+IKCP_OVERHEAD {
@@ -1566,6 +1719,11 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 			s.kcpInput(data)
 			return
 		}
+		if l.sessionMismatchHandlerSet.Load() != 0 {
+			if callback, ok := l.callbackForSessionMismatch.Load().(ListenerSessionMismatchCallBackType); ok {
+				callback(addr, conv)
+			}
+		}
 		// conversation id mismatched, only accept reset packet with sn == 0
 		if sn != 0 {
 			return
@@ -1582,9 +1740,6 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	}
 
 	// Now we have a valid conversation id here without a session object, create a new session.
-	if !validConv(conv) {
-		return
-	}
 	// do not let the new sessions overwhelm accept queue
 	if len(l.chAccepts) >= cap(l.chAccepts) {
 		return
@@ -1615,6 +1770,28 @@ func (l *Listener) SetOOBHandler(callback ListenerOOBCallBackType) error {
 	l.callbackForOOB.Store(callback)
 	l.oobHandlerSet.Store(1)
 	return nil
+}
+
+// SetSessionMismatchHandler registers a callback for reconnect packets whose
+// conversation ID cannot be matched to exactly one existing session. The
+// callback is independent of the legacy ping mechanism and is invoked synchronously from
+// the listener input path; it should return quickly. Passing nil unregisters
+// the callback.
+func (l *Listener) SetSessionMismatchHandler(callback ListenerSessionMismatchCallBackType) error {
+	if callback == nil {
+		l.callbackForSessionMismatch.Store(ListenerSessionMismatchCallBackType(func(net.Addr, uint32) {}))
+		l.sessionMismatchHandlerSet.Store(0)
+		return nil
+	}
+	l.callbackForSessionMismatch.Store(callback)
+	l.sessionMismatchHandlerSet.Store(1)
+	return nil
+}
+
+// SetSessionNotMatchHandler is kept as a naming-compatible alias for
+// SetSessionMismatchHandler.
+func (l *Listener) SetSessionNotMatchHandler(callback ListenerSessionMismatchCallBackType) error {
+	return l.SetSessionMismatchHandler(callback)
 }
 
 // SendOOB sends an out-of-band (OOB) packet to addr using conv as its
@@ -1684,6 +1861,47 @@ func (l *Listener) SendOOB(data []byte, addr net.Addr, conv uint32) error {
 	atomic.AddUint64(&DefaultSnmp.OutPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(n))
 	return nil
+}
+
+// SendSessionControl sends a dedicated session recovery control packet.
+func (l *Listener) SendSessionControl(data []byte, addr net.Addr, conv uint32) error {
+	fec := l.dataShards > 0 && l.parityShards > 0
+	var buf []byte
+	if fec {
+		buf = make([]byte, fecHeaderSizePlus2+convSize+len(data))
+		binary.LittleEndian.PutUint32(buf, ^uint32(0))
+		binary.LittleEndian.PutUint16(buf[4:], typeSessionControl)
+		binary.LittleEndian.PutUint16(buf[6:], uint16(convSize+len(data)))
+		binary.LittleEndian.PutUint32(buf[fecHeaderSizePlus2:], conv)
+		copy(buf[fecHeaderSizePlus2+convSize:], data)
+	} else {
+		buf = make([]byte, convSize+2+len(data))
+		binary.LittleEndian.PutUint32(buf, conv)
+		binary.LittleEndian.PutUint16(buf[convSize:], typeSessionControl)
+		copy(buf[convSize+2:], data)
+	}
+	cryptoHeaderSize := 0
+	if block, ok := l.block.(*aeadCrypt); ok {
+		cryptoHeaderSize = block.NonceSize()
+		nonce := buf[:cryptoHeaderSize]
+		fillRand(nonce)
+		buf = block.Seal(buf[:cryptoHeaderSize], nonce, buf[cryptoHeaderSize:], nil)
+	} else if l.block != nil {
+		cryptoHeaderSize = cryptHeaderSize
+		fillRand(buf[:nonceSize])
+		checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
+		binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
+		l.block.Encrypt(buf, buf)
+	}
+	_, err := l.conn.WriteTo(buf, addr)
+	return err
+}
+
+func (l *Listener) sendSessionMismatch(addr net.Addr, conv uint32) {
+	_ = l.SendSessionControl([]byte{sessionControlMismatch}, addr, conv)
+	if l.FnOutOfBandPing != nil {
+		go BfSendUdpPing8(l, addr)
+	}
 }
 
 func (l *Listener) notifyReadError(err error) {
@@ -1930,28 +2148,20 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 	}
 
 	var convid uint32
-	for !validConv(convid) {
-		if err := binary.Read(rand.Reader, binary.LittleEndian, &convid); err != nil {
-			_ = conn.Close()
-			return nil, errors.WithStack(err)
-		}
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &convid); err != nil {
+		_ = conn.Close()
+		return nil, errors.WithStack(err)
 	}
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, true, udpaddr, block), nil
 }
 
 // NewConn4 establishes a session and talks KCP protocol over a packet connection.
 func NewConn4(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, ownConn bool, conn net.PacketConn) (*UDPSession, error) {
-	if !validConv(convid) {
-		return nil, errors.New("invalid conversation id")
-	}
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, ownConn, raddr, block), nil
 }
 
 // NewConn3 establishes a session and talks KCP protocol over a packet connection.
 func NewConn3(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
-	if !validConv(convid) {
-		return nil, errors.New("invalid conversation id")
-	}
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, false, raddr, block), nil
 }
 
